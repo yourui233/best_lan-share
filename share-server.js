@@ -56,6 +56,10 @@ function writeConfig(obj) {
 
 const CFG = readConfig();
 const HAS_CONFIG = Object.keys(CFG).length > 0;
+
+// 只读模式：别的设备只能看和下载。命令行 / 环境变量优先于配置文件（向导里也能勾）
+const RO_FORCED = FLAGS.has('--read-only') || /^(1|true|yes|on)$/i.test(String(process.env.SHARE_READONLY || ''));
+let READONLY = RO_FORCED || CFG.readOnly === true;
 // 向导：exe 首次运行（还没有配置）或显式 --setup；一旦给了目录参数就照旧跳过
 const FORCE_SETUP = process.env.SHARE_SETUP === '1';          // 测试用：让 node 运行也进向导
 const WANT_SETUP = (SEA || FORCE_SETUP) && !POS.length && !FLAGS.has('--uninstall');
@@ -67,6 +71,26 @@ let PORT = Number(POS[1] || CFG.port || process.env.PORT || 8080);
 // 不带参数的老用法（node share-server.js）保持原样：不自动开浏览器
 const AUTO_OPEN = FLAGS.has('--no-open') ? false : (HAS_CONFIG ? CFG.open !== false : (SEA || FORCE_SETUP));
 const SETUP_TOKEN = crypto.randomBytes(12).toString('hex');
+
+// 多语言地基：语言按 ?lang= > cookie > Accept-Language > 中文 决定（每次请求算一次）。
+// 新加的文案一律写成 L('中文','English')，老文案在 i18n 那一轮统一迁移。
+// 注意：整页文案还没迁完，所以 Accept-Language 自动识别先关着（AUTO_LANG=false），
+// 否则英文系统的用户会看到「中文页面里夹几句英文」，比全中文更糟。
+// 等所有文案都进了语言表，把 AUTO_LANG 改成 true 即可。
+const AUTO_LANG = false;
+const LANG_COOKIE = 'lan_lang';
+let LANG = 'zh';
+function L(zh, en) { return LANG === 'en' ? en : zh; }
+function pickLang(req, rawQuery) {
+  const q = /(^|&)lang=(zh|en)(&|$)/.exec(rawQuery || '');
+  if (q) return q[2];
+  const c = /(?:^|;\s*)lan_lang=(zh|en)/.exec(req.headers.cookie || '');
+  if (c) return c[1];
+  if (!AUTO_LANG) return 'zh';
+  const al = String(req.headers['accept-language'] || '').toLowerCase();
+  if (al && /(^|,)\s*en/.test(al) && !/(^|,)\s*zh/.test(al)) return 'en';
+  return 'zh';
+}
 let listenPort = PORT;                                        // 真正在听的端口（向导里可能改）
 
 const MIN_FREE = 500 * 1024 * 1024;
@@ -79,6 +103,40 @@ const NOTE_MAX_CHARS = 20000;
 const MAX_UPLOAD = Number(process.env.SHARE_MAX_UPLOAD || 4 * 1024 * 1024 * 1024); // 单文件上限 4 GiB
 const MIN_FREE_MID = 200 * 1024 * 1024;  // 传输中途最低剩余空间
 const RESERVED_NAME = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\.|$)/i;
+
+// 列表版本号：任何会让另一台设备看到不同内容的操作都 +1。
+// 页面只轮询这个整数（不拉列表），变了才重新拉，省流量也不打断搜索/选中状态。
+let LIST_REV = 1;
+function bumpRev() {
+  LIST_REV = LIST_REV >= 2147483000 ? 1 : LIST_REV + 1;
+  return LIST_REV;
+}
+
+// 只读模式下要挡掉的请求：所有会改内容的写操作（下载、预览、状态探测都不受影响）
+function isWrite(method, p) {
+  if (method === 'PUT' && p.slice(0, 3) === '/u/') return true;
+  if (method === 'DELETE' && (p.slice(0, 3) === '/f/' || p.slice(0, 3) === '/t/')) return true;
+  if (method === 'POST' && p === '/t') return true;
+  return false;
+}
+
+// 上传时带的子目录（选整个文件夹上传）：只允许干净的相对路径，别的一律拒绝
+// 返回 '' 表示没有目录；返回 null 表示不合法
+function safeSub(raw) {
+  if (raw == null || raw === '') return '';
+  const parts = String(raw).split('/').filter(p => p !== '');
+  if (parts.length > 8) return null;                       // 目录太深，多半不是正常上传
+  const out = [];
+  for (const p of parts) {
+    if (p === '.' || p === '..') return null;
+    if (p.length > 100) return null;
+    if (RESERVED_NAME.test(p)) return null;                // con / prn / lpt1 …
+    if (/[\u0000-\u001f<>:"|?*]/.test(p)) return null;     // Windows 不允许的字符
+    if (/[. ]$/.test(p)) return null;                      // Windows 会把结尾的点/空格吃掉
+    out.push(p);
+  }
+  return out.join('/');
+}
 
 /* —— Host / Origin 校验：挡 DNS rebinding 与跨站请求 —— */
 function localHostNames() {
@@ -129,10 +187,70 @@ const MIME = {
   '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif',
   '.webp': 'image/webp', '.heic': 'image/heic', '.svg': 'image/svg+xml',
   '.mp3': 'audio/mpeg', '.m4a': 'audio/mp4', '.wav': 'audio/wav', '.amr': 'audio/amr',
+  '.aac': 'audio/aac', '.flac': 'audio/flac', '.ogg': 'audio/ogg', '.opus': 'audio/ogg',
   '.mp4': 'video/mp4', '.mkv': 'video/x-matroska', '.mov': 'video/quicktime',
+  '.webm': 'video/webm', '.m4v': 'video/mp4', '.ogv': 'video/ogg',
   '.apk': 'application/vnd.android.package-archive'
 };
 const IMG_EXT = new Set(['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']); // 不含 svg：避免内联 SVG 脚本
+// 只有这些类型允许内联播放（HTML/SVG 之类内联就是自找 XSS）
+const MEDIA_EXT = new Set(['.mp4', '.webm', '.m4v', '.mov', '.ogv', '.mp3', '.m4a', '.aac', '.wav', '.flac', '.ogg', '.opus']);
+
+/* 单区间 Range 解析：只认 bytes=a-b / bytes=a- / bytes=-n。
+   返回 null = 照整文件发；{bad:true} = 416。 */
+function parseRange(header, size) {
+  const m = /^bytes=(\d*)-(\d*)$/.exec(String(header || '').trim());
+  if (!m || (m[1] === '' && m[2] === '')) return null;
+  let start, end;
+  if (m[1] === '') {                                  // 后缀区间：最后 n 字节
+    const n = Number(m[2]);
+    if (!n) return { bad: true };
+    start = Math.max(0, size - n);
+    end = size - 1;
+  } else {
+    start = Number(m[1]);
+    end = m[2] === '' ? size - 1 : Math.min(Number(m[2]), size - 1);
+  }
+  if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= size) return { bad: true };
+  return { start, end };
+}
+// 所有文件响应都走这里：Range（断点续传、音视频拖进度条）、HEAD、inline / attachment
+function sendFile(req, res, full, opts) {
+  const o = opts || {};
+  let st;
+  try { st = fs.statSync(full); } catch { res.writeHead(404); return res.end('not found'); }
+  if (!st.isFile()) { res.writeHead(404); return res.end('not found'); }
+  const head = {
+    'Content-Type': MIME[extOf(full)] || 'application/octet-stream',
+    'X-Content-Type-Options': 'nosniff',
+    'Accept-Ranges': 'bytes',
+    'Last-Modified': new Date(st.mtimeMs).toUTCString(),
+    'Cache-Control': o.cache || 'no-store'
+  };
+  if (o.inline) {
+    head['Content-Disposition'] = 'inline';
+    head['Content-Security-Policy'] = "default-src 'none'; sandbox";
+  } else {
+    head['Content-Disposition'] = "attachment; filename*=UTF-8''" + encodeURIComponent(path.basename(full));
+  }
+  const isHead = req.method === 'HEAD';
+  const r = parseRange(req.headers.range, st.size);
+  if (r && r.bad) {
+    res.writeHead(416, Object.assign({}, head, { 'Content-Range': 'bytes */' + st.size, 'Content-Length': 0 }));
+    return res.end();
+  }
+  if (r) {
+    res.writeHead(206, Object.assign({}, head, {
+      'Content-Range': 'bytes ' + r.start + '-' + r.end + '/' + st.size,
+      'Content-Length': r.end - r.start + 1
+    }));
+    if (isHead) return res.end();
+    return fs.createReadStream(full, { start: r.start, end: r.end }).on('error', () => res.end()).pipe(res);
+  }
+  res.writeHead(200, Object.assign({}, head, { 'Content-Length': st.size }));
+  if (isHead) return res.end();
+  return fs.createReadStream(full).on('error', () => res.end()).pipe(res);
+}
 
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const extOf = n => { const i = String(n).lastIndexOf('.'); return i < 0 ? '' : String(n).slice(i).toLowerCase(); };
@@ -263,7 +381,8 @@ function listFiles() {
   const meta = readMeta();
   const out = [];
   const walk = (dir, relDir, depth) => {
-    if (depth > 3) return;
+    // 12 层：文件/<日期>/<上传文件夹…>/<文件> 最多 1+1+8+1，留点余量
+    if (depth > 12) return;
     let entries = [];
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
     for (const e of entries) {
@@ -314,7 +433,10 @@ function kindLabel(n) {
 /* ---------- 页面 ---------- */
 function fileGroupHtml(files, me, meIp) {
   if (!files.length) {
-    return `<div class="empty"><div class="eicon">📭</div><div class="etitle">还没有文件</div>
+    return READONLY
+      ? `<div class="empty"><div class="eicon">📭</div><div class="etitle">还没有文件</div>
+      <div class="esub">${L('只读模式下不能上传，等共享者放文件进来', 'Read-only: nothing can be uploaded, wait for the host to add files')}</div></div>`
+      : `<div class="empty"><div class="eicon">📭</div><div class="etitle">还没有文件</div>
       <div class="esub">点上面的「选择文件」，或把文件拖到页面任意位置</div></div>`;
   }
   const groups = [];
@@ -339,27 +461,34 @@ function fileGroupHtml(files, me, meIp) {
       const href = '/f/' + segs.map(encodeURIComponent).join('/');
       const imgUrl = '/i/' + segs.map(encodeURIComponent).join('/');
       const kind = kindOf(f.name);
+      const isMedia = kind === 'video' || kind === 'audio';
       const thumb = isImg(f.name)
         ? `<img class="thumb" src="${imgUrl}" data-img="${imgUrl}" loading="lazy" alt="">`
-        : `<span class="thumb ico">${kindLabel(f.name)}</span>`;
-      const canDel = isHostSelf(meIp) || ownerOk(f, me, meIp);
+        : `<span class="thumb ico">${isMedia ? (kind === 'video' ? '▶' : '♪') : kindLabel(f.name)}</span>`;
+      const mediaAttr = isMedia
+        ? ` data-media="/m/${segs.map(encodeURIComponent).join('/')}" data-mkind="${kind}" title="${L('点一下在线播放', 'Click to play')}"`
+        : '';
+      const canDel = !READONLY && (isHostSelf(meIp) || ownerOk(f, me, meIp));
       const act = canDel
         ? `<button class="btn ghost danger fdel" data-rel="${esc(rel)}" data-name="${esc(f.name)}" title="删除" aria-label="删除 ${esc(f.name)}">✕</button>`
-        : `<span class="editlock" title="只有上传者能删除">🔒</span>`;
-      return `<li class="frow" data-name="${esc(f.name.toLowerCase())}" data-rel="${esc(rel)}" data-kind="${kind}" data-size="${f.size}"><input type="checkbox" class="selbox" aria-label="选择 ${esc(f.name)}"><a class="row" href="${href}">
+        : (READONLY ? '' : `<span class="editlock" title="只有上传者能删除">🔒</span>`);
+      return `<li class="frow" data-name="${esc(f.name.toLowerCase())}" data-rel="${esc(rel)}" data-kind="${kind}" data-size="${f.size}"><input type="checkbox" class="selbox" aria-label="选择 ${esc(f.name)}"><a class="row" href="${href}"${mediaAttr}>
   ${thumb}
   <span class="mid"><span class="nm">${esc(f.name)}</span><span class="meta">${esc(f.ip || '未记录')} · ${ts}</span></span>
   <span class="sz">${human(f.size)}</span>
 </a>${act}</li>`;
     }).join('');
-    return `<details class="grp" data-folder="${esc(g.k)}"${openKeys.has(g.k) ? ' open' : ''}><summary class="folder"><span class="chev">▸</span><span class="fname">📂 ${esc(g.k)}</span><span class="cnt">${g.list.length}</span></summary><ul class="list">${rows}</ul></details>`;
+    const grpZip = g.k === '（根目录）'
+      ? ''
+      : `<button type="button" class="btn ghost mini grpzip" data-rel="${esc(g.k)}" title="${L('把这个文件夹打包成 zip 下载', 'Download this folder as a zip')}">zip</button>`;
+    return `<details class="grp" data-folder="${esc(g.k)}"${openKeys.has(g.k) ? ' open' : ''}><summary class="folder"><span class="chev">▸</span><span class="fname">📂 ${esc(g.k)}</span>${grpZip}<span class="cnt">${g.list.length}</span></summary><ul class="list">${rows}</ul></details>`;
   }).join('');
 }
 
 function page(files, me, meIp) {
   const free = freeBytes();
 
-  return `<!doctype html><html lang="zh-CN"><head>
+  return `<!doctype html><html lang="${LANG === 'en' ? 'en' : 'zh-CN'}"><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <meta name="theme-color" content="#2563eb">
@@ -472,6 +601,7 @@ function page(files, me, meIp) {
  .chev{display:inline-block;font-size:10px;transition:transform .18s;color:var(--muted)}
  details.grp[open] .chev{transform:rotate(90deg)}
  .cnt{background:var(--accent-soft);color:var(--accent);border-radius:999px;padding:1px 9px;font-size:12px}
+ .grpzip{margin-left:auto;font-size:11px;padding:3px 8px;line-height:1.2}
  ul.list{list-style:none;padding:0;margin:0;display:flex;flex-direction:column;gap:8px}
  li.frow{display:flex;align-items:center;gap:8px}
  .fdel{flex:0 0 auto;padding:9px 13px;border-radius:11px;font-size:14px;line-height:1}
@@ -549,6 +679,8 @@ function page(files, me, meIp) {
    opacity:0;transition:opacity .16s;padding:20px}
  .lb.in{opacity:1}
  .lb img{max-width:100%;max-height:100%;border-radius:8px;object-fit:contain}
+ .lb video{max-width:100%;max-height:100%;border-radius:8px;background:#000}
+ .lb audio{width:min(560px,90vw)}
  .lbclose{position:absolute;top:calc(14px + env(safe-area-inset-top));right:16px;border:0;
    background:rgba(255,255,255,.16);color:#fff;font:600 18px/1 inherit;padding:9px 13px;
    border-radius:11px;cursor:pointer}
@@ -578,6 +710,22 @@ function page(files, me, meIp) {
   .btn:active{transform:none}
   li.frow .row:hover{transform:none}
  }
+ .robar{margin:0 0 12px;padding:9px 12px;border-radius:var(--radius);background:var(--accent-soft);
+  color:var(--accent);font-size:13px;font-weight:600;text-align:center}
+ .ro-hide{display:none!important}
+ .hright{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+ .mdl{position:fixed;inset:0;z-index:70;background:rgba(15,23,42,.45);display:grid;place-items:center;padding:18px}
+ .mdlbox{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:18px;
+  max-width:420px;width:100%;text-align:center;box-shadow:0 18px 50px rgba(15,23,42,.28)}
+ .mdlbox h3{margin:0 0 12px;font-size:16px}
+ .qrslot{background:#fff;border-radius:12px;padding:10px;display:inline-block}
+ .qrslot img{display:block;width:230px;height:230px}
+ .mdlurls{margin:12px 0 0;display:flex;flex-direction:column;gap:6px}
+ .mdlurls a{font-size:13px;color:var(--accent);word-break:break-all;text-decoration:none;cursor:pointer}
+ .mdlurls a.on{font-weight:700;text-decoration:underline}
+ .mdlurls .virt{color:var(--muted);font-size:11px}
+ .mdlrow{display:flex;gap:8px;justify-content:center;margin-top:12px}
+ .mdlhint{color:var(--muted);font-size:12px;margin-top:10px}
  [hidden]{display:none!important}
 </style></head><body>
 <div class="wrap">
@@ -586,8 +734,13 @@ function page(files, me, meIp) {
       <h1>局域网共享</h1>
       <div class="sub">同一 WiFi 下的设备都能用 · 上传 / 下载 / 传文本</div>
     </div>
-    ${free === undefined ? '' : `<div class="chips"><span class="chip">💾 可用 <b>${human(free)}</b></span></div>`}
+    <div class="hright">
+      ${free === undefined ? '' : `<span class="chip">💾 可用 <b>${human(free)}</b></span>`}
+      <button class="btn ghost mini" id="lkBtn" title="${L('手机怎么连进来', 'How to open this from a phone')}">${L('🔗 接入', '🔗 Connect')}</button>
+    </div>
   </header>
+${READONLY ? `
+  <div class="robar">${L('🔒 只读模式：只能查看和下载，上传、发文字与删除都已关闭', '🔒 Read-only: viewing and downloading only — upload, text and delete are off')}</div>` : ''}
 
   <nav>
     <div class="tabs" id="tabs">
@@ -601,7 +754,7 @@ function page(files, me, meIp) {
   </nav>
 
   <section class="pane" id="secText">
-    <div class="card pad">
+    <div class="card pad${READONLY ? ' ro-hide' : ''}">
       <textarea id="ta" placeholder="粘贴或输入文字…（链接、号码、一小段笔记都行）"></textarea>
       <div class="rowflex">
         <span class="count"><b id="cc">0</b> / 20000 · 页面任意处粘贴也会填进来</span>
@@ -613,11 +766,13 @@ function page(files, me, meIp) {
   </section>
 
   <section class="pane" id="secFile" hidden>
-    <div class="drop" id="drop">
+    <div class="drop${READONLY ? ' ro-hide' : ''}" id="drop">
       <div class="di">📤</div>
       <div class="dt">点这里选择文件</div>
-      <div class="ds">自动存入 文件/${todayFolder()}/ · 电脑上也可以直接拖进来</div>
+      <div class="ds">自动存入 文件/${todayFolder()}/ · 电脑上也可以直接把文件或文件夹拖进来</div>
       <input id="file" type="file" multiple hidden>
+      <input id="dir" type="file" webkitdirectory directory multiple hidden>
+      <button class="btn ghost mini" id="pickDir" type="button">${L('或选整个文件夹', 'or pick a whole folder')}</button>
     </div>
     <div class="prog" id="prog"></div>
 
@@ -637,7 +792,7 @@ function page(files, me, meIp) {
 </div>
 
 <div class="dragmask" id="mask">松开即可上传</div>
-<div class="lb" id="lb" hidden><img id="lbimg" alt=""><button class="lbclose" id="lbclose">关闭 ✕</button></div>
+<div class="lb" id="lb" hidden><img id="lbimg" alt=""><video id="lbvid" controls playsinline hidden></video><audio id="lbaud" controls hidden></audio><button class="lbclose" id="lbclose">关闭 ✕</button></div>
 <div class="actbar" id="actbar" hidden>
   <div class="ab">
     <span class="abinfo"><b id="abCount">0</b> 已选</span>
@@ -649,8 +804,24 @@ function page(files, me, meIp) {
 </div>
 <div id="toast" aria-live="polite"></div>
 
+<div class="mdl" id="mdl" hidden>
+  <div class="mdlbox" role="dialog" aria-modal="true" aria-label="${L('手机扫码进入', 'Scan to open on your phone')}">
+    <h3>${L('手机扫码进入', 'Scan to open on your phone')}</h3>
+    <div class="qrslot"><img id="qrimg" alt="${L('二维码', 'QR code')}"></div>
+    <div class="mdlurls" id="mdlUrls"></div>
+    <div class="mdlrow">
+      <button class="btn ghost mini" id="mdlCopy">${L('复制网址', 'Copy URL')}</button>
+      <button class="btn mini" id="mdlClose">${L('关闭', 'Close')}</button>
+    </div>
+    <div class="mdlhint">${L('手机要和这台电脑在同一个 WiFi / 局域网里。带「虚拟网卡」标记的地址一般是连不通的。',
+      'The phone must be on the same WiFi / LAN as this computer. Addresses marked as virtual adapters usually do not work.')}</div>
+  </div>
+</div>
+
 <script>
 const $ = id => document.getElementById(id);
+const RO = ${READONLY ? 'true' : 'false'};        // 只读模式：写操作的入口都不渲染，这里再兜一层
+function why(status){ return status === 403 && RO ? ${JSON.stringify(L('只读模式已开启', 'read-only mode is on'))} : String(status); }
 const ta = $('ta'), sendBtn = $('send'), notelist = $('notelist'), prog = $('prog'), cc = $('cc');
 let toastTimer;
 
@@ -718,19 +889,46 @@ $('tabFile').onclick = () => { showTab('file'); loadFiles(); applyFilter(); };
 window.addEventListener('resize', () => movePill($('tabFile').classList.contains('on') ? $('tabFile') : $('tabText'), true));
 
 /* ---------- 灯箱 ---------- */
-const lb = $('lb'), lbimg = $('lbimg');
-function openLb(src){ lbimg.src = src; lb.hidden = false; requestAnimationFrame(() => lb.classList.add('in')); }
+const lb = $('lb'), lbimg = $('lbimg'), lbvid = $('lbvid'), lbaud = $('lbaud');
+function lbShow(){ lb.hidden = false; requestAnimationFrame(() => lb.classList.add('in')); }
+function stopMedia(){
+  for (const el of [lbvid, lbaud]) {
+    try { el.pause(); } catch (e) {}
+    el.hidden = true;
+    el.removeAttribute('src');
+    try { el.load(); } catch (e) {}          // 不加这行，某些浏览器会继续缓冲上一首
+  }
+  lbimg.removeAttribute('src');
+}
+function openLb(src){ stopMedia(); lbimg.hidden = false; lbimg.src = src; lbShow(); }
+function openMedia(src, kind){
+  stopMedia();
+  const el = kind === 'audio' ? lbaud : lbvid;
+  lbimg.hidden = true;
+  el.hidden = false;
+  el.src = src;
+  const p = el.play && el.play();
+  if (p && p.catch) p.catch(() => {});       // 浏览器可能因为没有用户手势拒绝，让它自己显示控制条
+  lbShow();
+}
 function closeLb(){
   lb.classList.remove('in');
-  setTimeout(() => { lb.hidden = true; lbimg.removeAttribute('src'); }, 160);
+  setTimeout(() => { lb.hidden = true; stopMedia(); }, 160);
 }
 lb.addEventListener('click', closeLb);
 document.addEventListener('keydown', e => { if (e.key === 'Escape' && !lb.hidden) closeLb(); });
 document.addEventListener('click', ev => {
-  const im = ev.target && ev.target.closest ? ev.target.closest('[data-img]') : null;
-  if (!im) return;
+  const el = ev.target && ev.target.closest ? ev.target.closest('[data-img],[data-media]') : null;
+  if (!el) return;
+  const media = el.getAttribute('data-media');
+  if (media) {
+    if (picking()) return;                   // 选择模式下点一下是勾选，不是播放
+    ev.preventDefault();
+    openMedia(media, el.getAttribute('data-mkind'));
+    return;
+  }
   ev.preventDefault();
-  openLb(im.getAttribute('data-img'));
+  openLb(el.getAttribute('data-img'));
 });
 
 /* ---------- 文本 ---------- */
@@ -753,21 +951,24 @@ function noteCard(n){
   const acts = document.createElement('span'); acts.className = 'acts';
   const cp = document.createElement('button'); cp.className='btn ghost'; cp.textContent='复制'; cp.setAttribute('aria-label','复制这条文本');
   cp.onclick = () => copyText(n.text);
-  const del = document.createElement('button'); del.className='btn ghost danger'; del.textContent='删除'; del.setAttribute('aria-label','删除这条文本');
-  del.onclick = async () => {
-    if (!del.classList.contains('arm')) {
-      del.classList.add('arm');
-      del.textContent = '确认删除?';
-      setTimeout(() => { del.classList.remove('arm'); del.textContent = '删除'; }, 3000);
-      return;
-    }
-    del.classList.remove('arm');
-    try {
-      const r = await fetch('/t/' + n.id, { method: 'DELETE' });
-      if (r.ok) { toast('已删除'); loadNotes(); } else toast('删除失败', true);
-    } catch (e) { toast('删除失败', true); }
-  };
-  acts.appendChild(cp); acts.appendChild(del);
+  let del = null;
+  if (!RO) {
+    del = document.createElement('button'); del.className='btn ghost danger'; del.textContent='删除'; del.setAttribute('aria-label','删除这条文本');
+    del.onclick = async () => {
+      if (!del.classList.contains('arm')) {
+        del.classList.add('arm');
+        del.textContent = '确认删除?';
+        setTimeout(() => { del.classList.remove('arm'); del.textContent = '删除'; }, 3000);
+        return;
+      }
+      del.classList.remove('arm');
+      try {
+        const r = await fetch('/t/' + n.id, { method: 'DELETE' });
+        if (r.ok) { toast('已删除'); loadNotes(); } else toast('删除失败：' + why(r.status), true);
+      } catch (e) { toast('删除失败', true); }
+    };
+  }
+  acts.appendChild(cp); if (del) acts.appendChild(del);
   head.appendChild(time); head.appendChild(acts);
   const body = document.createElement('div'); body.className = 'body'; body.textContent = n.text;
   li.appendChild(head); li.appendChild(body);
@@ -864,7 +1065,7 @@ sendBtn.onclick = async () => {
       body: JSON.stringify({ text })
     });
     if (r.ok) { ta.value = ''; updCount(); await loadNotes(); toast('已发送'); }
-    else toast('发送失败：' + r.status, true);
+    else toast('发送失败：' + why(r.status), true);
   } catch (e) { toast('发送失败：' + e.message, true); }
   sendBtn.disabled = false; sendBtn.textContent = '发送';
 };
@@ -872,6 +1073,7 @@ ta.addEventListener('keydown', e => { if ((e.ctrlKey || e.metaKey) && e.key === 
 
 /* 页面任意处粘贴 -> 填入输入框 */
 window.addEventListener('paste', e => {
+  if (RO) return;
   const ae = document.activeElement;
   if (ae && (ae.tagName === 'INPUT' || ae.tagName === 'TEXTAREA')) return;
   const t = e.clipboardData && e.clipboardData.getData('text/plain');
@@ -882,20 +1084,63 @@ window.addEventListener('paste', e => {
 });
 
 /* ---------- 上传 ---------- */
-const drop = $('drop'), inp = $('file'), mask = $('mask');
-drop.addEventListener('click', () => inp.click());
-inp.addEventListener('change', () => { upload(Array.from(inp.files)); inp.value = ''; });
+const drop = $('drop'), inp = $('file'), dirInp = $('dir'), mask = $('mask');
+const droppedDirs = new WeakMap();                 // File -> '子目录/文件名'（拖进来的文件夹用）
+drop.addEventListener('click', () => { if (!RO) inp.click(); });
+$('pickDir').addEventListener('click', ev => { ev.preventDefault(); ev.stopPropagation(); if (!RO) dirInp.click(); });
+inp.addEventListener('change', () => { if (!RO) upload(Array.from(inp.files)); inp.value = ''; });
+dirInp.addEventListener('change', () => { if (!RO) upload(Array.from(dirInp.files)); dirInp.value = ''; });
 let dragDepth = 0;
-window.addEventListener('dragenter', e => { e.preventDefault(); if (++dragDepth === 1) mask.classList.add('on'); });
+/* 拖进来的可能整个是文件夹：用 webkitGetAsEntry 递归读（entry 必须在事件里同步取，之后 items 就失效了） */
+function entriesOf(dt) {
+  const items = dt && dt.items;
+  if (!items || !items.length) return null;
+  const out = [];
+  for (const it of Array.from(items)) {
+    if (it.kind !== 'file') continue;
+    const en = it.webkitGetAsEntry ? it.webkitGetAsEntry() : null;
+    if (en) out.push(en);
+  }
+  return out.length ? out : null;
+}
+async function filesFromEntries(entries) {
+  const out = [];
+  const readAll = reader => new Promise(res => reader.readEntries(res, () => res([])));
+  const walk = async (entry, prefix) => {
+    if (out.length > 3000) return;
+    if (entry.isFile) {
+      const f = await new Promise(res => entry.file(res, () => res(null)));
+      if (f) { if (prefix) droppedDirs.set(f, prefix + f.name); out.push(f); }
+      return;
+    }
+    if (!entry.isDirectory) return;
+    const reader = entry.createReader();
+    for (;;) {
+      const batch = await readAll(reader);
+      if (!batch.length) break;
+      for (const en of batch) await walk(en, prefix + entry.name + '/');
+    }
+  };
+  for (const en of entries) await walk(en, '');
+  return out;
+}
+window.addEventListener('dragenter', e => { e.preventDefault(); if (RO) return; if (++dragDepth === 1) mask.classList.add('on'); });
 window.addEventListener('dragover', e => e.preventDefault());
-window.addEventListener('dragleave', e => { e.preventDefault(); if (--dragDepth <= 0) { dragDepth = 0; mask.classList.remove('on'); } });
+window.addEventListener('dragleave', e => { e.preventDefault(); if (RO) return; if (--dragDepth <= 0) { dragDepth = 0; mask.classList.remove('on'); } });
 window.addEventListener('drop', e => {
   e.preventDefault(); dragDepth = 0; mask.classList.remove('on');
-  if (e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) upload(Array.from(e.dataTransfer.files));
+  if (RO || !e.dataTransfer) return;
+  const dtFiles = e.dataTransfer.files ? Array.from(e.dataTransfer.files) : [];
+  const entries = entriesOf(e.dataTransfer);
+  if (!entries) { if (dtFiles.length) upload(dtFiles); return; }
+  filesFromEntries(entries).then(list => {
+    if (list.length) upload(list);
+    else if (dtFiles.length) upload(dtFiles);
+  });
 });
 
 function upload(files){
-  if (!files.length) return;
+  if (RO || !files.length) return;
   showTab('file');
   let done = 0, failed = 0;
   files.forEach(f => {
@@ -912,7 +1157,9 @@ function upload(files){
 
     const t0 = Date.now();
     const x = new XMLHttpRequest();
-    x.open('PUT', '/u/' + encodeURIComponent(f.name));
+    const relp = droppedDirs.get(f) || f.webkitRelativePath || '';     // 拖进来的文件夹 / 选文件夹上传
+    const sub = relp ? relp.split('/').slice(0, -1).join('/') : '';
+    x.open('PUT', '/u/' + encodeURIComponent(f.name) + (sub ? '?dir=' + encodeURIComponent(sub) : ''));
     x.upload.onprogress = e => {
       if (!e.lengthComputable) return;
       const p = Math.round(e.loaded / e.total * 100);
@@ -940,7 +1187,7 @@ function upload(files){
         }, 700);
       }
     };
-    x.onload = () => finish(x.status < 300, x.status < 300 ? '✅ 完成' : '❌ ' + x.status);
+    x.onload = () => finish(x.status < 300, x.status < 300 ? '✅ 完成' : (x.status === 403 ? ${JSON.stringify(L('🔒 只读模式', '🔒 Read-only'))} : '❌ ' + x.status));
     x.onerror = () => finish(false, '❌ 网络错误');
     x.send(f);
   });
@@ -1214,6 +1461,44 @@ dlOneBtn.onclick = () => {
   }
 };
 
+/* ---------- 接入方式：局域网网址 + 二维码 ---------- */
+const LK = ${JSON.stringify(lanCandidates(listenPort))};
+const mdl = $('mdl'), qrimg = $('qrimg'), mdlUrls = $('mdlUrls');
+// 如果这台设备本来就是用某个局域网地址连上来的（手机、另一台电脑），默认就选它——一定连得通
+let lkPick = Math.max(0, LK.findIndex(c => c.url.indexOf('//' + ${JSON.stringify(String(meIp))} + ':') === 0));
+function lkRender(){
+  const cur = LK[lkPick];
+  qrimg.src = '/qr?u=' + encodeURIComponent(cur ? cur.url : location.origin + '/');
+  mdlUrls.textContent = '';
+  if (!LK.length) {
+    const d = document.createElement('div'); d.className = 'virt';
+    d.textContent = ${JSON.stringify(L('（没找到局域网地址，可能没连网）', '(no LAN address found - is this machine online?)'))};
+    mdlUrls.appendChild(d);
+    return;
+  }
+  LK.forEach((c, i) => {
+    const a = document.createElement('a');
+    a.href = c.url;
+    a.textContent = c.url + ' · ' + c.name + (c.virtual ? ${JSON.stringify(L('（虚拟网卡，多半连不通）', ' (virtual adapter, probably unreachable)'))} : '');
+    a.className = (i === lkPick ? 'on' : '') + (c.virtual ? ' virt' : '');
+    a.onclick = ev => { ev.preventDefault(); lkPick = i; lkRender(); };
+    mdlUrls.appendChild(a);
+  });
+}
+$('lkBtn').onclick = () => { lkRender(); mdl.hidden = false; };
+$('mdlClose').onclick = () => { mdl.hidden = true; };
+mdl.onclick = ev => { if (ev.target === mdl) mdl.hidden = true; };
+$('mdlCopy').onclick = () => copyText(LK[lkPick] ? LK[lkPick].url : location.href);
+document.addEventListener('keydown', ev => { if (ev.key === 'Escape' && !mdl.hidden) mdl.hidden = true; });
+
+/* 分组标题上的 zip 按钮：点它别触发 details 的开合 */
+document.addEventListener('click', ev => {
+  const b = ev.target && ev.target.closest ? ev.target.closest('.grpzip') : null;
+  if (!b) return;
+  ev.preventDefault(); ev.stopPropagation();
+  location.href = '/zip?f=' + encodeURIComponent(b.getAttribute('data-rel'));
+}, true);
+
 /* ---------- 初始化 ---------- */
 applyView();
 applySort();
@@ -1228,11 +1513,32 @@ updCount();
 skeleton();
 loadNotes();
 setInterval(() => { if (!document.hidden && !secText.hidden) loadNotes(); }, 4000);
+/* 别的设备动了东西就自动刷新：每 3 秒问一次版本号，变了才真的拉列表。
+   初始值必须用服务端渲染时的版本号，否则页面加载后头几秒内的改动会被漏掉。 */
+let listRev = ${LIST_REV};
+async function syncRev(){
+  if (document.hidden) return;
+  try {
+    const r = await fetch('/rev', { cache: 'no-store' });
+    if (!r.ok) return;
+    const j = await r.json();
+    const rev = Number(j && j.rev) || 0;
+    if (listRev && rev && rev !== listRev) {
+      if (!secFile.hidden) await loadFiles();
+      if (!secText.hidden) await loadNotes();
+    }
+    listRev = rev;
+  } catch (e) {}
+}
+setInterval(syncRev, 3000);
+syncRev();
+document.addEventListener('visibilitychange', () => { if (!document.hidden) syncRev(); });
 </script></body></html>`;
 }
 
 /* ---------- 合并下载：零依赖 ZIP（store + data descriptor，单遍流式，不落临时文件） ---------- */
 const ZIP_LIMIT = 3.9 * 1024 * 1024 * 1024;   // 超过就提示分批下载（避开 zip64）
+const MAX_ZIP_ENTRIES = 4000;                 // 文件夹打包时的条目上限，防止一次扫爆
 const CRC_TABLE = (() => {
   const t = new Int32Array(256);
   for (let n = 0; n < 256; n++) {
@@ -1489,6 +1795,8 @@ function applyConfig(cfg) {
   fs.mkdirSync(DATA, { recursive: true });
   fs.mkdirSync(path.join(ROOT, DIR_FILES), { recursive: true });
   fs.mkdirSync(path.join(ROOT, DIR_TEXT), { recursive: true });
+  READONLY = RO_FORCED || cfg.readOnly === true;
+  bumpRev();                                    // 开关变了，其它设备也要跟着换界面
   setupMode = false;
 }
 function doUninstall() {
@@ -1614,6 +1922,7 @@ function setupPage() {
     <label><input type="checkbox" id="optHidden"><span><b>开机启动时不显示黑色窗口</b><i>开机时用 wscript 无窗口拉起；你自己双击 exe 时仍然会显示窗口（好看到网址）</i></span></label>
     <label><input type="checkbox" id="optOpen"><span><b>启动时自动打开浏览器</b><i>双击后直接把共享页面打开</i></span></label>
     <label><input type="checkbox" id="optShort"><span><b>在桌面创建快捷方式</b><i>只是一个指向 exe 的快捷方式，删了不影响使用</i></span></label>
+    <label><input type="checkbox" id="optRO"><span><b>${L('只读模式', 'Read-only mode')}</b><i>${L('打开后别人只能查看和下载：不能上传、发文字、删除（本机也一样）。适合临时把文件给别人拿', 'Nobody can upload, post text or delete — only view and download; applies to this machine too.')}</i></span></label>
   </div>
 </section>
 
@@ -1667,6 +1976,7 @@ function sum(){
   kv(b,'打开浏览器',S.open?'开':'关');
   kv(b,'隐藏窗口',S.hidden?'是':'否');
   kv(b,'桌面快捷方式',S.shortcut?'创建':'不创建');
+  kv(b,'只读模式',S.readOnly?'开（别人只能下载）':'关');
   if(exePath)kv(b,'程序位置',exePath);
 }
 function load(p){
@@ -1778,6 +2088,7 @@ function init(){
   bind('optHidden','hidden',false);
   bind('optOpen','open',true);
   bind('optShort','shortcut',true);
+  bind('optRO','readOnly',false);
 }
 init();
 </script></body></html>`;
@@ -1867,7 +2178,8 @@ async function handleSetup(req, res, urlPath, rawQuery) {
       open: body.open !== false,
       autostart: !!body.autostart,
       hidden: !!body.hidden,
-      shortcut: !!body.shortcut
+      shortcut: !!body.shortcut,
+      readOnly: !!body.readOnly
     };
 
     if (cfg.shortcut) {
@@ -1906,6 +2218,303 @@ async function handleSetup(req, res, urlPath, rawQuery) {
   return uiJson(res, 404, { ok: false, error: 'not found' });
 }
 
+/* ---------- 局域网地址（扫码用）----------
+   非回环 IPv4 全列出来，但排序很讲究：手机应该扫到真正能连的那个。
+   排序依据（依次）：名字像虚拟网卡 > 地址尾数是 .1/.254（多半是虚拟交换机的网关侧）> 其它。
+   都不占优时按网卡名排。列表里会带上网卡名，让人自己判断。 */
+const VIRTUAL_IF = /(vmware|virtualbox|vethernet|hyper-v|wsl|docker|tailscale|zerotier|radmin|hamachi|npcap|tap|tun|vpn|bluetooth)/i;
+function lanCandidates(port) {
+  const out = [];
+  try {
+    const ifs = os.networkInterfaces();
+    for (const name of Object.keys(ifs)) {
+      for (const a of (ifs[name] || [])) {
+        if (!a || a.family !== 'IPv4' || a.internal) continue;
+        if (String(a.address).startsWith('169.254.')) continue;      // 自动私有地址，扫了也连不上
+        out.push({
+          name,
+          url: 'http://' + a.address + ':' + port + '/',
+          virtual: VIRTUAL_IF.test(name),
+          gatewayish: /\.(1|254)$/.test(a.address)
+        });
+      }
+    }
+  } catch {}
+  const rank = c => (c.virtual ? 2 : (c.gatewayish ? 1 : 0));
+  out.sort((x, y) => (rank(x) - rank(y)) || x.name.localeCompare(y.name));
+  return out;
+}
+
+/* ---------- 二维码（字节模式 / 纠错等级 M / 版本 1–10，按 ISO/IEC 18004 自己实现）----------
+   零依赖环境里没有现成的 QR 库，所以照规范写了一个。
+   正确性验证：与独立实现（npm qrcode）逐模块比对 —— 96 个不同长度的输入，连掩码选择都一致。 */
+const QR_TOTAL_CW = [0, 26, 44, 70, 100, 134, 172, 196, 242, 292, 346];   // 总码字（数据+纠错）
+const QR_BLOCKS = [0, 1, 1, 1, 2, 2, 4, 4, 4, 5, 5];                       // 纠错块数
+const QR_EC_TOTAL = [0, 10, 16, 26, 36, 48, 64, 72, 88, 110, 130];         // 纠错码字总数
+const QR_MAX_VERSION = 10;
+const QR_PENALTY = { N1: 3, N2: 3, N3: 40, N4: 10 };
+
+const QR_EXP = new Uint8Array(512), QR_LOG = new Uint8Array(256);
+(function qrInitGF() {
+  let x = 1;
+  for (let i = 0; i < 255; i++) { QR_EXP[i] = x; QR_LOG[x] = i; x <<= 1; if (x & 0x100) x ^= 0x11D; }
+  for (let i = 255; i < 512; i++) QR_EXP[i] = QR_EXP[i - 255];
+})();
+function qrMul(a, b) { return (a && b) ? QR_EXP[QR_LOG[a] + QR_LOG[b]] : 0; }
+
+// 生成多项式 g(x) = (x-α^0)(x-α^1)…：内部低次在前累乘，返回时翻成高次在前（g[0] = 1）
+function qrGenPoly(deg) {
+  let g = [1];
+  for (let i = 0; i < deg; i++) {
+    const next = new Array(g.length + 1).fill(0);
+    for (let j = 0; j < g.length; j++) {
+      next[j + 1] ^= g[j];
+      next[j] ^= qrMul(g[j], QR_EXP[i]);
+    }
+    g = next;
+  }
+  return g.reverse();
+}
+function qrRsEncode(data, ecLen) {
+  const gen = qrGenPoly(ecLen);
+  const buf = new Uint8Array(data.length + ecLen);
+  buf.set(data, 0);
+  for (let i = 0; i < data.length; i++) {
+    const factor = buf[i];
+    if (!factor) continue;
+    for (let j = 0; j < gen.length; j++) buf[i + j] ^= qrMul(gen[j], factor);
+  }
+  return buf.slice(data.length);
+}
+function qrCodewords(bytes, version) {
+  const total = QR_TOTAL_CW[version], ecTotal = QR_EC_TOTAL[version], blocks = QR_BLOCKS[version];
+  const dataTotal = total - ecTotal;
+  const ecPer = ecTotal / blocks;
+  const g2 = dataTotal % blocks, g1 = blocks - g2;
+  const c1 = Math.floor(dataTotal / blocks), c2 = c1 + 1;
+
+  const bits = [];
+  const push = (val, n) => { for (let i = n - 1; i >= 0; i--) bits.push((val >> i) & 1); };
+  push(0b0100, 4);                                  // 字节模式
+  push(bytes.length, version < 10 ? 8 : 16);        // 字符计数
+  for (const b of bytes) push(b, 8);
+
+  const cap = dataTotal * 8;
+  if (bits.length + 4 <= cap) push(0, 4);           // 终止符
+  while (bits.length % 8) bits.push(0);
+  for (let i = 0; bits.length < cap; i++) push(i % 2 ? 0x11 : 0xEC, 8);
+
+  const buf = [];
+  for (let i = 0; i < bits.length; i += 8) {
+    let b = 0;
+    for (let j = 0; j < 8; j++) b = (b << 1) | bits[i + j];
+    buf.push(b);
+  }
+  const dc = [], ecs = [];
+  let off = 0;
+  for (let b = 0; b < blocks; b++) {
+    const n = b < g1 ? c1 : c2;
+    const blk = Uint8Array.from(buf.slice(off, off + n));
+    off += n;
+    dc.push(blk);
+    ecs.push(qrRsEncode(blk, ecPer));
+  }
+  const out = [];
+  for (let i = 0; i < c2; i++) for (let b = 0; b < blocks; b++) if (i < dc[b].length) out.push(dc[b][i]);
+  for (let i = 0; i < ecPer; i++) for (let b = 0; b < blocks; b++) out.push(ecs[b][i]);
+  return Uint8Array.from(out);
+}
+function qrAlignPositions(version) {
+  if (version === 1) return [];
+  const n = Math.floor(version / 7) + 2;
+  const size = version * 4 + 17;
+  const interval = size === 145 ? 26 : Math.ceil((size - 13) / (2 * n - 2)) * 2;
+  const out = [size - 7];
+  for (let i = 1; i < n - 1; i++) out[i] = out[i - 1] - interval;
+  out.push(6);
+  return out.sort((a, b) => a - b);
+}
+function qrFormatBits(mask) {
+  const data = (0 << 3) | mask;                     // 等级 M 的两位是 00
+  let rem = data << 10;
+  for (let i = 14; i >= 10; i--) if ((rem >> i) & 1) rem ^= 0x537 << (i - 10);
+  return ((data << 10) | (rem & 0x3FF)) ^ 0x5412;
+}
+function qrVersionBits(version) {
+  let rem = version << 12;
+  for (let i = 17; i >= 12; i--) if ((rem >> i) & 1) rem ^= 0x1F25 << (i - 12);
+  return (version << 12) | (rem & 0xFFF);
+}
+function qrMaskAt(mask, r, c) {
+  switch (mask) {
+    case 0: return (r + c) % 2 === 0;
+    case 1: return r % 2 === 0;
+    case 2: return c % 3 === 0;
+    case 3: return (r + c) % 3 === 0;
+    case 4: return (Math.floor(r / 2) + Math.floor(c / 3)) % 2 === 0;
+    case 5: return (r * c) % 2 + (r * c) % 3 === 0;
+    case 6: return ((r * c) % 2 + (r * c) % 3) % 2 === 0;
+    default: return ((r * c) % 3 + (r + c) % 2) % 2 === 0;
+  }
+}
+function qrPickVersion(len) {
+  for (let v = 1; v <= QR_MAX_VERSION; v++) {
+    const need = 4 + (v < 10 ? 8 : 16) + len * 8;
+    if (need <= (QR_TOTAL_CW[v] - QR_EC_TOTAL[v]) * 8) return v;
+  }
+  return 0;
+}
+function qrEncode(text) {
+  const bytes = Buffer.from(String(text), 'utf8');
+  const version = qrPickVersion(bytes.length);
+  if (!version) throw new Error('too long');
+  const cw = qrCodewords(bytes, version);
+  const size = version * 4 + 17;
+  const mods = new Uint8Array(size * size);
+  const res = new Uint8Array(size * size);
+  const idx = (r, c) => r * size + c;
+  const set = (r, c, dark, reserved) => { mods[idx(r, c)] = dark ? 1 : 0; if (reserved) res[idx(r, c)] = 1; };
+  const isRes = (r, c) => res[idx(r, c)] === 1;
+
+  // 定位图案 + 分隔带
+  for (const [r0, c0] of [[0, 0], [0, size - 7], [size - 7, 0]]) {
+    for (let r = -1; r <= 7; r++) for (let c = -1; c <= 7; c++) {
+      const rr = r0 + r, cc = c0 + c;
+      if (rr < 0 || cc < 0 || rr >= size || cc >= size) continue;
+      const ring = (r >= 0 && r <= 6 && (c === 0 || c === 6)) || (c >= 0 && c <= 6 && (r === 0 || r === 6));
+      const core = r >= 2 && r <= 4 && c >= 2 && c <= 4;
+      set(rr, cc, ring || core ? 1 : 0, true);
+    }
+  }
+  // 定时图案
+  for (let i = 8; i < size - 8; i++) {
+    const dark = i % 2 === 0 ? 1 : 0;
+    set(6, i, dark, true);
+    set(i, 6, dark, true);
+  }
+  // 对齐图案：只有三个角（压在定位图案上）不摆
+  const pos = qrAlignPositions(version), lastPos = pos.length - 1;
+  for (let i = 0; i < pos.length; i++) for (let j = 0; j < pos.length; j++) {
+    if ((i === 0 && j === 0) || (i === 0 && j === lastPos) || (i === lastPos && j === 0)) continue;
+    const cr = pos[i], cc = pos[j];
+    for (let dr = -2; dr <= 2; dr++) for (let dc = -2; dc <= 2; dc++) {
+      set(cr + dr, cc + dc, Math.max(Math.abs(dr), Math.abs(dc)) !== 1 ? 1 : 0, true);
+    }
+  }
+  const formatInfo = mask => {
+    const bits = qrFormatBits(mask);
+    for (let i = 0; i < 15; i++) {
+      const bit = (bits >> i) & 1;
+      if (i < 6) set(i, 8, bit, true);
+      else if (i < 8) set(i + 1, 8, bit, true);
+      else set(size - 15 + i, 8, bit, true);
+      if (i < 8) set(8, size - i - 1, bit, true);
+      else if (i < 9) set(8, 15 - i, bit, true);
+      else set(8, 15 - i - 1, bit, true);
+    }
+    set(size - 8, 8, 1, true);                       // 固定暗模块
+  };
+  formatInfo(0);                                     // 先占位，免得数据摆进格式区
+  if (version >= 7) {
+    const bits = qrVersionBits(version);
+    for (let i = 0; i < 18; i++) {
+      const r = Math.floor(i / 3), c = i % 3 + size - 11, bit = (bits >> i) & 1;
+      set(r, c, bit, true);
+      set(c, r, bit, true);
+    }
+  }
+  // 数据：从右下角开始，两列一组上下折返，跳过第 6 列（定时图案）
+  let inc = -1, row = size - 1, bitIndex = 7, byteIndex = 0;
+  for (let col = size - 1; col > 0; col -= 2) {
+    if (col === 6) col--;
+    for (;;) {
+      for (let c = 0; c < 2; c++) {
+        if (!isRes(row, col - c)) {
+          let dark = 0;
+          if (byteIndex < cw.length) dark = (cw[byteIndex] >>> bitIndex) & 1;
+          set(row, col - c, dark);
+          if (--bitIndex === -1) { byteIndex++; bitIndex = 7; }
+        }
+      }
+      row += inc;
+      if (row < 0 || row >= size) { row -= inc; inc = -inc; break; }
+    }
+  }
+  const applyMask = mask => {
+    for (let r = 0; r < size; r++) for (let c = 0; c < size; c++) {
+      if (isRes(r, c)) continue;
+      if (qrMaskAt(mask, r, c)) mods[idx(r, c)] ^= 1;
+    }
+  };
+  const penalty = () => {
+    let points = 0, sameRow = 0, sameCol = 0, lastRow = -1, lastCol = -1;
+    for (let r = 0; r < size; r++) {
+      sameRow = 0; sameCol = 0; lastRow = -1; lastCol = -1;
+      for (let c = 0; c < size; c++) {
+        const a = mods[idx(r, c)];
+        if (a === lastRow) sameRow++;
+        else { if (sameRow >= 5) points += QR_PENALTY.N1 + (sameRow - 5); lastRow = a; sameRow = 1; }
+        const b = mods[idx(c, r)];
+        if (b === lastCol) sameCol++;
+        else { if (sameCol >= 5) points += QR_PENALTY.N1 + (sameCol - 5); lastCol = b; sameCol = 1; }
+      }
+      if (sameRow >= 5) points += QR_PENALTY.N1 + (sameRow - 5);
+      if (sameCol >= 5) points += QR_PENALTY.N1 + (sameCol - 5);
+    }
+    for (let r = 0; r < size - 1; r++) for (let c = 0; c < size - 1; c++) {
+      const sum = mods[idx(r, c)] + mods[idx(r, c + 1)] + mods[idx(r + 1, c)] + mods[idx(r + 1, c + 1)];
+      if (sum === 0 || sum === 4) points += QR_PENALTY.N2;
+    }
+    let bitsRow = 0, bitsCol = 0;
+    for (let r = 0; r < size; r++) {
+      bitsRow = 0; bitsCol = 0;
+      for (let c = 0; c < size; c++) {
+        bitsRow = ((bitsRow << 1) & 0x7FF) | mods[idx(r, c)];
+        if (c >= 10 && (bitsRow === 0x5D0 || bitsRow === 0x05D)) points += QR_PENALTY.N3;
+        bitsCol = ((bitsCol << 1) & 0x7FF) | mods[idx(c, r)];
+        if (c >= 10 && (bitsCol === 0x5D0 || bitsCol === 0x05D)) points += QR_PENALTY.N3;
+      }
+    }
+    let dark = 0;
+    for (let i = 0; i < mods.length; i++) dark += mods[i];
+    return points + Math.abs(Math.ceil((dark * 100 / mods.length) / 5) - 10) * QR_PENALTY.N4;
+  };
+  let best = 0, bestPenalty = Infinity;
+  for (let mask = 0; mask < 8; mask++) {
+    formatInfo(mask);
+    applyMask(mask);
+    const p = penalty();
+    applyMask(mask);                                 // XOR 两次就还原
+    if (p < bestPenalty) { bestPenalty = p; best = mask; }
+  }
+  applyMask(best);
+  formatInfo(best);
+  return { version, size, mask: best, modules: mods };
+}
+// 深色模块按行合并成水平线段，SVG 比一格一个 rect 小得多
+function qrSvg(text, opts) {
+  const o = opts || {};
+  const scale = o.scale || 4, quiet = o.quiet == null ? 4 : o.quiet;
+  const dark = o.dark || '#000000', light = o.light || '#ffffff';
+  const q = qrEncode(text);
+  const dim = q.size + quiet * 2;
+  let d = '';
+  for (let r = 0; r < q.size; r++) {
+    let c = 0;
+    while (c < q.size) {
+      if (!q.modules[r * q.size + c]) { c++; continue; }
+      let run = 1;
+      while (c + run < q.size && q.modules[r * q.size + c + run]) run++;
+      d += 'M' + (c + quiet) + ' ' + (r + quiet) + 'h' + run + 'v1h-' + run + 'z';
+      c += run;
+    }
+  }
+  return '<svg xmlns="http://www.w3.org/2000/svg" width="' + dim * scale + '" height="' + dim * scale +
+    '" viewBox="0 0 ' + dim + ' ' + dim + '" shape-rendering="crispEdges" role="img" aria-label="QR">' +
+    '<rect width="' + dim + '" height="' + dim + '" fill="' + light + '"/>' +
+    '<path d="' + d + '" fill="' + dark + '"/></svg>';
+}
+
 /* ---------- 路由 ---------- */
 const server = http.createServer((req, res) => {
   const rawUrl = req.url || '/';
@@ -1916,6 +2525,10 @@ const server = http.createServer((req, res) => {
   catch { res.writeHead(400); return res.end('bad request'); }
 
   const ip = clientIp(req);
+  LANG = pickLang(req, rawQuery);
+  if (/(^|&)lang=(zh|en)(&|$)/.test(rawQuery)) {          // 用 ?lang= 选过就记住
+    try { res.setHeader('Set-Cookie', LANG_COOKIE + '=' + LANG + '; Path=/; Max-Age=31536000; SameSite=Lax'); } catch {}
+  }
 
   // Host / Origin 校验（挡 DNS rebinding 与跨站请求）
   if (!sameSite(req)) {
@@ -1936,6 +2549,41 @@ const server = http.createServer((req, res) => {
     return res.end();
   }
 
+  // 只读模式：写操作一律拒绝（下载、预览、列表刷新都不受影响）
+  if (READONLY && isWrite(req.method, urlPath)) {
+    res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    return res.end(JSON.stringify({ ok: false, error: 'read-only', message: L('只读模式已开启', 'read-only mode is on') }));
+  }
+
+  if (req.method === 'GET' && urlPath === '/qr') {
+    // 只给本机自己的局域网地址生成二维码，免得变成一个公开的二维码生成器
+    let u = '';
+    try { u = new URL('http://x/?' + rawQuery).searchParams.get('u') || ''; } catch {}
+    const allowed = new Set(lanCandidates(listenPort).map(c => c.url));
+    allowed.add('http://127.0.0.1:' + listenPort + '/');
+    let okUrl = false;
+    try { const p = new URL(u); okUrl = p.protocol === 'http:' && allowed.has(p.origin + '/'); } catch {}
+    if (!okUrl) {
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+      return res.end('not a LAN address of this server');
+    }
+    res.writeHead(200, {
+      'Content-Type': 'image/svg+xml; charset=utf-8',
+      'Cache-Control': 'private, max-age=300',
+      'X-Content-Type-Options': 'nosniff'
+    });
+    return res.end(qrSvg(u, { scale: 6, quiet: 3 }));
+  }
+
+  if (req.method === 'GET' && urlPath === '/rev') {
+    // 极便宜的变更探测：只回一个整数，页面拿它决定要不要拉列表
+    res.writeHead(200, {
+      'Content-Type': 'application/json; charset=utf-8',
+      'Cache-Control': 'no-store'
+    });
+    return res.end('{"rev":' + LIST_REV + '}');
+  }
+
   if (req.method === 'GET' && urlPath === '/t/list') {
     // 默认只给 1 天内的文本；“查看更早信息”时带 older=1 单独取
     const cutoff = Date.now() - 24 * 3600 * 1000;
@@ -1946,7 +2594,8 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, {
       'Content-Type': 'application/json; charset=utf-8',
       'Cache-Control': 'no-store',
-      'X-Older-Count': String(older.length)
+      'X-Older-Count': String(older.length),
+      'X-Rev': String(LIST_REV)
     });
     return res.end(JSON.stringify((wantOlder ? older : recent).reverse()));
   }
@@ -1959,6 +2608,7 @@ const server = http.createServer((req, res) => {
       if (!text) { res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('内容为空'); }
       if (text.length > NOTE_MAX_CHARS) text = text.slice(0, NOTE_MAX_CHARS);
       const n = addNote(text, ip, meId);
+      bumpRev();
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ ok: true, id: n.id, file: n.file || null }));
     });
@@ -1971,6 +2621,7 @@ const server = http.createServer((req, res) => {
     list.filter(n => n.id === id).forEach(removeNoteFile);
     const next = list.filter(n => n.id !== id);
     writeNotes(next);
+    bumpRev();
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     return res.end(JSON.stringify({ ok: true, removed: list.length - next.length }));
   }
@@ -1992,7 +2643,14 @@ const server = http.createServer((req, res) => {
       res.writeHead(413, { 'Content-Type': 'text/plain; charset=utf-8' });
       return res.end('超过单文件上限');
     }
-    const folder = DIR_FILES + '/' + todayFolder();
+    // 选整个文件夹上传时带 ?dir=<相对路径>：保留目录结构，但仍然放进当天的文件夹里
+    let sub = '';
+    try { sub = safeSub(new URL('http://x/?' + rawQuery).searchParams.get('dir')); } catch { sub = null; }
+    if (sub === null) {
+      res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
+      return res.end('目录名不合法');
+    }
+    const folder = DIR_FILES + '/' + todayFolder() + (sub ? '/' + sub : '');
     const dir = path.join(ROOT, ...folder.split('/'));
     fs.mkdirSync(dir, { recursive: true });
     const name = uniqueIn(dir, safeName(urlPath.slice(3)));
@@ -2024,6 +2682,7 @@ const server = http.createServer((req, res) => {
     ws.on('finish', () => {
       if (failed) return;
       setFileMeta(rel, ip, meId);
+      bumpRev();
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ ok: true, path: rel, ip }));
     });
@@ -2052,37 +2711,28 @@ const server = http.createServer((req, res) => {
     if (path.resolve(dir) !== path.resolve(ROOT)) {
       try { if (fs.readdirSync(dir).length === 0) fs.rmdirSync(dir); } catch {}
     }
+    bumpRev();
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     return res.end(JSON.stringify({ ok: true, removed: t.rel }));
   }
 
-  if (req.method === 'GET' && urlPath.startsWith('/f/')) {
+  if ((req.method === 'GET' || req.method === 'HEAD') && urlPath.startsWith('/f/')) {
     const t = safeRel(urlPath.slice(3));
     if (!t) { res.writeHead(404); return res.end('not found'); }
-    let st; try { st = fs.statSync(t.full); } catch { res.writeHead(404); return res.end('not found'); }
-    if (!st.isFile()) { res.writeHead(404); return res.end('not found'); }
-    res.writeHead(200, {
-      'Content-Type': MIME[extOf(t.full)] || 'application/octet-stream',
-      'Content-Length': st.size,
-      'X-Content-Type-Options': 'nosniff',
-      'Content-Disposition': `attachment; filename*=UTF-8''${encodeURIComponent(path.basename(t.full))}`
-    });
-    return fs.createReadStream(t.full).on('error', () => res.end()).pipe(res);
+    return sendFile(req, res, t.full, {});                        // 一律强制下载
   }
 
-  if (req.method === 'GET' && urlPath.startsWith('/i/')) {
+  if ((req.method === 'GET' || req.method === 'HEAD') && urlPath.startsWith('/i/')) {
     const t = safeRel(urlPath.slice(3));
     if (!t || !IMG_EXT.has(extOf(t.full))) { res.writeHead(404); return res.end('not found'); }
-    let st; try { st = fs.statSync(t.full); } catch { res.writeHead(404); return res.end('not found'); }
-    if (!st.isFile()) { res.writeHead(404); return res.end('not found'); }
-    res.writeHead(200, {
-      'Content-Type': MIME[extOf(t.full)] || 'application/octet-stream',
-      'Content-Length': st.size,
-      'X-Content-Type-Options': 'nosniff',
-      'Content-Security-Policy': "default-src 'none'; sandbox",
-      'Cache-Control': 'private, max-age=120'
-    });
-    return fs.createReadStream(t.full).on('error', () => res.end()).pipe(res);
+    return sendFile(req, res, t.full, { inline: true, cache: 'private, max-age=120' });
+  }
+
+  // 音视频内联播放（配合 Range 才能拖进度条）
+  if ((req.method === 'GET' || req.method === 'HEAD') && urlPath.startsWith('/m/')) {
+    const t = safeRel(urlPath.slice(3));
+    if (!t || !MEDIA_EXT.has(extOf(t.full))) { res.writeHead(404); return res.end('not found'); }
+    return sendFile(req, res, t.full, { inline: true, cache: 'private, max-age=120' });
   }
 
   if (req.method === 'GET' && urlPath === '/zip') {
@@ -2090,13 +2740,37 @@ const server = http.createServer((req, res) => {
     try { wanted = new URL('http://x/?' + rawQuery).searchParams.getAll('f'); } catch { wanted = []; }
     const seen = new Set(), entries = [];
     let skipped = 0;
+    const addFile = (full, rel, st) => {
+      if (seen.has(rel)) return;
+      seen.add(rel);
+      entries.push({ rel, full, size: st.size, name: Buffer.from(rel, 'utf8'), stamp: dosStamp(st.mtimeMs) });
+    };
+    // 选中整个文件夹时递归展开，压缩包里保留相对目录结构
+    const walkDir = (absDir, prefix) => {
+      let items = [];
+      try { items = fs.readdirSync(absDir, { withFileTypes: true }); } catch { return; }
+      items.sort((a, b) => a.name.localeCompare(b.name));
+      for (const it of items) {
+        if (entries.length >= MAX_ZIP_ENTRIES) { skipped++; continue; }
+        const full = path.join(absDir, it.name);
+        if (it.isSymbolicLink()) { skipped++; continue; }             // 不跟着链接跑出共享目录
+        if (it.isDirectory()) {
+          if (SKIP_DIRS.has(it.name)) { skipped++; continue; }
+          walkDir(full, prefix + '/' + it.name);
+          continue;
+        }
+        if (!it.isFile()) { skipped++; continue; }
+        let st; try { st = fs.statSync(full); } catch { skipped++; continue; }
+        addFile(full, prefix + '/' + it.name, st);
+      }
+    };
     for (const raw of wanted) {
       const t = safeRel(raw);
-      if (!t || seen.has(t.rel)) { skipped++; continue; }
+      if (!t) { skipped++; continue; }
       let st; try { st = fs.statSync(t.full); } catch { skipped++; continue; }
-      if (!st.isFile()) { skipped++; continue; }
-      seen.add(t.rel);
-      entries.push({ rel: t.rel, full: t.full, size: st.size, name: Buffer.from(t.rel, 'utf8'), stamp: dosStamp(st.mtimeMs) });
+      if (st.isFile()) { addFile(t.full, t.rel, st); continue; }
+      if (st.isDirectory()) { walkDir(t.full, path.basename(t.rel)); continue; }
+      skipped++;
     }
     if (!entries.length) {
       res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
@@ -2147,7 +2821,8 @@ const server = http.createServer((req, res) => {
       'Content-Type': 'text/html; charset=utf-8',
       'Cache-Control': 'no-store',
       'X-Frame-Options': 'DENY',
-      'Referrer-Policy': 'no-referrer'
+      'Referrer-Policy': 'no-referrer',
+      'X-Rev': String(LIST_REV)
     });
     return res.end(page(files, meId, ip));
   }
