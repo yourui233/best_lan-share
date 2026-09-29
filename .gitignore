@@ -1,0 +1,24 @@
+# runtime / logs
+node_modules/
+npm-debug.log*
+*.log
+
+# the default data folder written by the server (never publish user data)
+*-data/
+shared/
+
+# editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+
+# local backups
+*.bak-*
+*~
+
+# build output of tools/build-exe.ps1 (the exe ships as a Release asset, not in git)
+dist/
+*.exe
+
+# scratch tests, if you drop them in
+test/

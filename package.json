@@ -1,0 +1,14 @@
+{
+  "name": "best_lan-share",
+  "version": "0.1.0-beta",
+  "description": "Zero-dependency LAN file & text sharing server - a single Node.js file, no npm install",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.15"
+  },
+  "scripts": {
+    "start": "node share-server.js ./shared 8080",
+    "build:exe": "powershell -ExecutionPolicy Bypass -File tools/build-exe.ps1"
+  }
+}

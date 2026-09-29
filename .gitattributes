@@ -1,0 +1,7 @@
+# Keep line endings identical across platforms
+* text=auto eol=lf
+
+# Windows Script Host convention
+*.vbs text eol=crlf
+
+*.png binary
