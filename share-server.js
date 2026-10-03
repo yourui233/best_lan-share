@@ -12,6 +12,11 @@ const net = require('net');
 const crypto = require('crypto');
 const { spawn, spawnSync } = require('child_process');
 
+// 兜底：单个请求出问题不该把整个共享服务带走。这里只记日志、不退出，
+// 免得一次磁盘写失败就让所有人的页面全挂掉。
+process.on('unhandledRejection', e => console.error('[share] unhandledRejection: ' + ((e && e.stack) || e)));
+process.on('uncaughtException', e => console.error('[share] uncaughtException: ' + ((e && e.stack) || e)));
+
 /* ---------- 单文件 exe（Node SEA）与配置 ---------- */
 // SEA 下 argv 的布局和 node 运行不一样（有的版本会把 exe 路径塞进 argv[1]），
 // 这里统一成和 node 一样的形状：[运行时, 脚本, 用户参数...]
@@ -148,7 +153,15 @@ function localHostNames() {
   String(process.env.SHARE_HOSTS || '').split(',').map(s => s.trim().toLowerCase()).filter(Boolean).forEach(x => set.add(x));
   return set;
 }
-const HOSTS = localHostNames();
+// 网卡地址是会变的（DHCP 续租、插拔网卡、连上 VPN）。只在启动时抓一次快照，
+// 后出现的地址就永远被拒 —— 而页面上的「接入」面板是实时枚举网卡的，于是它会
+// 把服务器自己 403 的地址列出来给用户点。所以这里按 TTL 重算。
+const HOSTS_TTL = 5000;
+let _hosts = localHostNames(), _hostsAt = Date.now();
+function HOSTS_now() {
+  if (Date.now() - _hostsAt >= HOSTS_TTL) { _hosts = localHostNames(); _hostsAt = Date.now(); }
+  return _hosts;
+}
 function hostNameOf(v) {
   const s = String(v || '').trim();
   if (!s) return '';
@@ -158,11 +171,11 @@ function hostNameOf(v) {
 }
 function sameSite(req) {
   const h = hostNameOf(req.headers.host);
-  if (!h || !HOSTS.has(h)) return false;
+  if (!h || !HOSTS_now().has(h)) return false;
   const o = req.headers.origin;
   if (o === undefined) return true;          // 非浏览器发起的请求（curl / 本机脚本）
   if (!o || o === 'null') return false;      // 沙箱/不透明源：拒绝
-  try { return HOSTS.has(hostNameOf(new URL(o).host)); } catch { return false; }
+  try { return HOSTS_now().has(hostNameOf(new URL(o).host)); } catch { return false; }
 }
 
 // 向导模式：只把默认的共享目录建出来（否则向导第 1 步一打开就是个打不开的路径），
@@ -299,6 +312,13 @@ function canDeleteFile(rel, meId, ip) {
   if (isHostSelf(ip)) return true;
   return ownerOk(readMeta()[rel], meId, ip);
 }
+// 便签的归属：新数据带 owner（cookie 身份）；老数据没有，退回按 IP 比，跟文件一个思路
+function canDeleteNote(n, meId, ip) {
+  if (!n) return false;
+  if (isHostSelf(ip)) return true;
+  if (n.owner) return n.owner === meId;
+  return !!n.ip && n.ip === ip;
+}
 function todayFolder() {
   const d = new Date(), p = n => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
@@ -318,12 +338,31 @@ function uniqueIn(dir, name) {
   for (let i = 2; i < 2000; i++) { const c = `${base} (${i})${ext}`; if (!fs.existsSync(path.join(dir, c))) return c; }
   return `${base}-${Date.now()}${ext}`;
 }
+// 符号链接和目录联接（junction）都能把路径指到共享目录之外。Windows 上 junction 在
+// lstat/readdir 里报的就是普通目录（libuv 只把真正的 symlink 标成 LINK），所以
+// isSymbolicLink() 挡不住它 —— 只能靠 realpath 判断目标到底落在哪。
+// 路径不存在时直接放行，交给后面的 stat 去回 404。
+let _rootReal = '', _rootRealAt = 0;
+function rootReal() {
+  if (!_rootReal || Date.now() - _rootRealAt > 5000) {
+    try { _rootReal = fs.realpathSync(ROOT); } catch { _rootReal = path.resolve(ROOT); }
+    _rootRealAt = Date.now();
+  }
+  return _rootReal;
+}
+function stillInside(full) {
+  let real;
+  try { real = fs.realpathSync(full); } catch { return true; }
+  const root = rootReal();
+  return real === root || real.startsWith(root.endsWith(path.sep) ? root : root + path.sep);
+}
 function safeRel(rel) {
   const segs = String(rel || '').split('/').map(s => s.trim()).filter(s => s && s !== '.' && s !== '..')
     .map(s => { const t = s.replace(/[\\:*?"<>|\u0000-\u001f]/g, '_'); return RESERVED_NAME.test(t) ? '_' + t : t; });
   if (!segs.length) return null;
   const p = path.resolve(path.join(ROOT, ...segs));
   if (p !== path.resolve(ROOT) && !p.startsWith(path.resolve(ROOT) + path.sep)) return null;
+  if (!stillInside(p)) return null;                       // 链接把目标指到共享目录之外
   return { rel: segs.join('/'), full: p, segs };
 }
 
@@ -339,7 +378,18 @@ function readNotes() {
       .map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
   } catch { return []; }
 }
-function writeNotes(list) { fs.writeFileSync(NOTES, list.map(n => JSON.stringify(n)).join('\n') + (list.length ? '\n' : '')); }
+// 这个函数绝不能往外抛：它的调用点都在 async 流程里，一抛就是 unhandled rejection，
+// 整个共享服务会跟着退出（磁盘写满、杀软瞬时锁住 notes.jsonl、数据目录被外部删掉都会命中）。
+// 返回 false 让调用方回一个明确的 500。
+function writeNotes(list) {
+  try {
+    fs.writeFileSync(NOTES, list.map(n => JSON.stringify(n)).join('\n') + (list.length ? '\n' : ''));
+    return true;
+  } catch (e) {
+    console.error('[share] 写 notes.jsonl 失败：' + (e && e.message ? e.message : e));
+    return false;
+  }
+}
 function noteFileName(t) {
   const d = new Date(t), p = n => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
@@ -347,7 +397,7 @@ function noteFileName(t) {
 function addNote(text, ip, meId) {
   const list = readNotes();
   const t = Date.now();
-  const n = { id: t.toString(36) + Math.random().toString(36).slice(2, 7), t, text, ip };
+  const n = { id: t.toString(36) + Math.random().toString(36).slice(2, 7), t, text, ip, owner: meId || '' };
   try {
     const dir = path.join(ROOT, DIR_TEXT);
     fs.mkdirSync(dir, { recursive: true });
@@ -357,8 +407,7 @@ function addNote(text, ip, meId) {
     setFileMeta(n.file, ip, meId);
   } catch {}
   list.push(n);
-  writeNotes(list);
-  return n;
+  return { note: n, saved: writeNotes(list) };
 }
 function removeNoteFile(n) {
   if (!n || !n.file) return;
@@ -389,7 +438,7 @@ function listFiles() {
       if (e.name[0] === '.') continue;
       const full = path.join(dir, e.name);
       const rel = relDir ? relDir + '/' + e.name : e.name;
-      if (e.isDirectory()) { walk(full, rel, depth + 1); continue; }
+      if (e.isDirectory()) { if (stillInside(full)) walk(full, rel, depth + 1); continue; }   // 不跟进链接
       if (!e.isFile()) continue;
       let st; try { st = fs.statSync(full); } catch { continue; }
       out.push({ rel, folder: relDir, name: e.name, size: st.size, mtime: st.mtimeMs, ip: (meta[rel] || {}).ip || '', id: (meta[rel] || {}).id || '' });
@@ -714,6 +763,29 @@ function page(files, me, meIp) {
   color:var(--accent);font-size:13px;font-weight:600;text-align:center}
  .ro-hide{display:none!important}
  .hright{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+ /* 「接入」是别人进到这个共享的唯一入口（手机扫码），别让它长得像个次要按钮。
+    高度写死 30px，和旁边的容量 chip（29px）齐平 —— 靠实心底色和字重醒目，不靠体积。
+    这里刻意用长写属性：font 简写里放 inherit 是非法值，整条会被浏览器丢掉，
+    line-height 一失效就会被 🔗 这个 emoji 的字形把行盒撑高（实测 35px）。 */
+ .lkbtn{position:relative;display:inline-flex;align-items:center;justify-content:center;
+   height:30px;padding:0 14px;border:0;border-radius:11px;cursor:pointer;white-space:nowrap;
+   background:var(--accent);color:#fff;
+   font-family:inherit;font-size:13px;font-weight:700;line-height:1;
+   box-shadow:0 1px 6px rgba(37,99,235,.3);
+   transition:transform .12s, box-shadow .18s, filter .18s}
+ .lkbtn:hover{filter:brightness(1.06);box-shadow:0 2px 10px rgba(37,99,235,.45)}
+ .lkbtn:active{transform:scale(.97)}
+ .lkbtn::after{content:'';position:absolute;inset:-1px;border-radius:12px;border:2px solid var(--accent);
+   animation:lkring 2.6s ease-out infinite;pointer-events:none}
+ @keyframes lkring{
+   0%{opacity:.5;transform:scale(.98)}
+   70%,100%{opacity:0;transform:scale(1.18)}
+ }
+ @media (prefers-color-scheme:dark){
+   .lkbtn{color:#0b1220;box-shadow:0 1px 6px rgba(110,168,254,.3)}
+   .lkbtn:hover{box-shadow:0 2px 10px rgba(110,168,254,.45)}
+ }
+ @media (prefers-reduced-motion:reduce){ .lkbtn::after{animation:none;opacity:0} }
  .mdl{position:fixed;inset:0;z-index:70;background:rgba(15,23,42,.45);display:grid;place-items:center;padding:18px}
  .mdlbox{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);padding:18px;
   max-width:420px;width:100%;text-align:center;box-shadow:0 18px 50px rgba(15,23,42,.28)}
@@ -736,7 +808,7 @@ function page(files, me, meIp) {
     </div>
     <div class="hright">
       ${free === undefined ? '' : `<span class="chip">💾 可用 <b>${human(free)}</b></span>`}
-      <button class="btn ghost mini" id="lkBtn" title="${L('手机怎么连进来', 'How to open this from a phone')}">${L('🔗 接入', '🔗 Connect')}</button>
+      <button class="lkbtn" id="lkBtn" title="${L('手机怎么连进来', 'How to open this from a phone')}">${L('🔗 接入', '🔗 Connect')}</button>
     </div>
   </header>
 ${READONLY ? `
@@ -952,7 +1024,7 @@ function noteCard(n){
   const cp = document.createElement('button'); cp.className='btn ghost'; cp.textContent='复制'; cp.setAttribute('aria-label','复制这条文本');
   cp.onclick = () => copyText(n.text);
   let del = null;
-  if (!RO) {
+  if (!RO && n.can) {              // can 由服务端算好：只有发布者本人和本机会拿到 true
     del = document.createElement('button'); del.className='btn ghost danger'; del.textContent='删除'; del.setAttribute('aria-label','删除这条文本');
     del.onclick = async () => {
       if (!del.classList.contains('arm')) {
@@ -964,7 +1036,12 @@ function noteCard(n){
       del.classList.remove('arm');
       try {
         const r = await fetch('/t/' + n.id, { method: 'DELETE' });
-        if (r.ok) { toast('已删除'); loadNotes(); } else toast('删除失败：' + why(r.status), true);
+        if (r.ok) { toast('已删除'); loadNotes(); }
+        else {
+          let msg = '删除失败：' + why(r.status);
+          try { const j = await r.json(); if (j && j.message) msg = j.message; } catch (e) {}
+          toast(msg, true);
+        }
       } catch (e) { toast('删除失败', true); }
     };
   }
@@ -2597,7 +2674,9 @@ const server = http.createServer((req, res) => {
       'X-Older-Count': String(older.length),
       'X-Rev': String(LIST_REV)
     });
-    return res.end(JSON.stringify((wantOlder ? older : recent).reverse()));
+    // can 只用来决定客户端渲不渲染删除按钮；真正的删除请求服务端会独立再校验一次
+    const pack = arr => arr.map(n => ({ id: n.id, t: n.t, text: n.text, ip: n.ip, file: n.file, can: canDeleteNote(n, meId, ip) }));
+    return res.end(JSON.stringify(pack(wantOlder ? older : recent).reverse()));
   }
 
   if (req.method === 'POST' && urlPath === '/t') {
@@ -2607,7 +2686,11 @@ const server = http.createServer((req, res) => {
       text = text.replace(/\r\n/g, '\n').trim();
       if (!text) { res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' }); return res.end('内容为空'); }
       if (text.length > NOTE_MAX_CHARS) text = text.slice(0, NOTE_MAX_CHARS);
-      const n = addNote(text, ip, meId);
+      const { note: n, saved } = addNote(text, ip, meId);
+      if (!saved) {
+        res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+        return res.end(JSON.stringify({ ok: false, error: 'save-failed', message: L('保存失败：服务端写不进文本索引', 'Could not save: the note index on the server is not writable') }));
+      }
       bumpRev();
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ ok: true, id: n.id, file: n.file || null }));
@@ -2618,9 +2701,22 @@ const server = http.createServer((req, res) => {
   if (req.method === 'DELETE' && urlPath.startsWith('/t/')) {
     const id = urlPath.slice(3);
     const list = readNotes();
-    list.filter(n => n.id === id).forEach(removeNoteFile);
+    const victim = list.filter(n => n.id === id);
+    if (!victim.length) {
+      res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
+      return res.end(JSON.stringify({ ok: false, error: 'not-found' }));
+    }
+    // 便签同样要认归属，否则同一网络里任何人都能删掉别人发的文本（连同 快捷文本/*.txt）
+    if (!victim.some(n => canDeleteNote(n, meId, ip))) {
+      res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+      return res.end(JSON.stringify({ ok: false, error: 'only-owner', message: L('只有发布者能删除这条文本', 'Only the poster can delete this note') }));
+    }
+    victim.forEach(removeNoteFile);
     const next = list.filter(n => n.id !== id);
-    writeNotes(next);
+    if (!writeNotes(next)) {
+      res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
+      return res.end(JSON.stringify({ ok: false, error: 'save-failed', message: L('删除失败：服务端写不进文本索引', 'Delete failed: the note index on the server is not writable') }));
+    }
     bumpRev();
     res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
     return res.end(JSON.stringify({ ok: true, removed: list.length - next.length }));
@@ -2661,8 +2757,14 @@ const server = http.createServer((req, res) => {
     const abort = (code, msg) => {
       if (failed) return;
       failed = true;
-      try { res.writeHead(code, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end(msg); } catch {}
-      ws.destroy(); fs.unlink(dest, () => {}); req.destroy();
+      try { req.unpipe(ws); } catch {}
+      ws.destroy(); fs.unlink(dest, () => {});
+      // 先把响应刷出去再 destroy：直接 req.destroy() 会把还没落盘的响应一起带走，
+      // 客户端看到的是连接重置，而不是「超过单文件上限」这句话
+      try {
+        res.writeHead(code, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end(msg, () => { try { req.destroy(); } catch {} });
+      } catch { try { req.destroy(); } catch {} }
     };
     req.on('aborted', () => { failed = true; ws.destroy(); fs.unlink(dest, () => {}); });
     req.on('data', c => {
@@ -2677,7 +2779,8 @@ const server = http.createServer((req, res) => {
     req.pipe(ws);
     ws.on('error', () => {
       failed = true; try { fs.unlinkSync(dest); } catch {}
-      res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('写入失败');
+      if (res.headersSent) return;      // abort() 可能已经回过 413/507，再 writeHead 会抛 ERR_HTTP_HEADERS_SENT
+      try { res.writeHead(500, { 'Content-Type': 'text/plain; charset=utf-8' }); res.end('写入失败'); } catch {}
     });
     ws.on('finish', () => {
       if (failed) return;
@@ -2753,7 +2856,7 @@ const server = http.createServer((req, res) => {
       for (const it of items) {
         if (entries.length >= MAX_ZIP_ENTRIES) { skipped++; continue; }
         const full = path.join(absDir, it.name);
-        if (it.isSymbolicLink()) { skipped++; continue; }             // 不跟着链接跑出共享目录
+        if (it.isSymbolicLink() || !stillInside(full)) { skipped++; continue; }   // 不跟着链接跑出共享目录
         if (it.isDirectory()) {
           if (SKIP_DIRS.has(it.name)) { skipped++; continue; }
           walkDir(full, prefix + '/' + it.name);
