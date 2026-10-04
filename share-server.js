@@ -118,8 +118,10 @@ function bumpRev() {
 }
 
 // 只读模式下要挡掉的请求：所有会改内容的写操作（下载、预览、状态探测都不受影响）
+// 兑换提取码不算写操作：它只发一张"看得见私有文件"的通行证，不改磁盘上的东西
 function isWrite(method, p) {
   if (method === 'PUT' && p.slice(0, 3) === '/u/') return true;
+  if (method === 'PATCH' && p.slice(0, 3) === '/f/') return true;      // 重命名 / 改可见范围
   if (method === 'DELETE' && (p.slice(0, 3) === '/f/' || p.slice(0, 3) === '/t/')) return true;
   if (method === 'POST' && p === '/t') return true;
   return false;
@@ -234,7 +236,7 @@ function sendFile(req, res, full, opts) {
   try { st = fs.statSync(full); } catch { res.writeHead(404); return res.end('not found'); }
   if (!st.isFile()) { res.writeHead(404); return res.end('not found'); }
   const head = {
-    'Content-Type': MIME[extOf(full)] || 'application/octet-stream',
+    'Content-Type': o.ct || MIME[extOf(full)] || 'application/octet-stream',
     'X-Content-Type-Options': 'nosniff',
     'Accept-Ranges': 'bytes',
     'Last-Modified': new Date(st.mtimeMs).toUTCString(),
@@ -244,7 +246,9 @@ function sendFile(req, res, full, opts) {
     head['Content-Disposition'] = 'inline';
     head['Content-Security-Policy'] = "default-src 'none'; sandbox";
   } else {
-    head['Content-Disposition'] = "attachment; filename*=UTF-8''" + encodeURIComponent(path.basename(full));
+    // o.dlName：磁盘名和用户看到的文件名不一样时（加密文件落盘是随机串）用真实名下载
+    const dl = o.dlName || path.basename(full);
+    head['Content-Disposition'] = "attachment; filename*=UTF-8''" + encodeURIComponent(dl);
   }
   const isHead = req.method === 'HEAD';
   const r = parseRange(req.headers.range, st.size);
@@ -302,6 +306,13 @@ function ensureId(req, res) {
   res.setHeader('Set-Cookie', COOKIE + '=' + fresh + '; Path=/; Max-Age=63072000; HttpOnly; SameSite=Lax');
   return fresh;
 }
+// 追加一个 Set-Cookie，而不是覆盖 —— 同一个响应里可能既要下发 lan_id 又要下发通行证
+function addCookie(res, value) {
+  const cur = res.getHeader('Set-Cookie');
+  const arr = cur === undefined ? [] : (Array.isArray(cur) ? cur.slice() : [String(cur)]);
+  arr.push(value);
+  res.setHeader('Set-Cookie', arr);
+}
 // 归属判定：优先 cookie 身份；没有 id 的旧数据退回按 IP 比
 function ownerOk(m, meId, ip) {
   if (!m) return false;
@@ -319,6 +330,63 @@ function canDeleteNote(n, meId, ip) {
   if (n.owner) return n.owner === meId;
   return !!n.ip && n.ip === ip;
 }
+
+/* ---------- 可见范围 / 提取码 / 加密标记 ----------
+   元数据里新增的字段（老记录没有，一律按默认值读，所以旧的 files.json 不用迁移）：
+     name  显示名。加密文件在磁盘上是随机名，真实文件名只存在这里
+     vis   'public'（默认）| 'private'：私有文件对非所有者完全不可见（列表里不出现，直链 404）
+     enc   true = 磁盘上是浏览器端加密后的密文，服务端不持有密钥、也不解密
+     code  仅 private：提取码。谁拿到码就能"兑换"一张通行证 cookie，从而看到这个文件
+   说明：这是局域网里的一道"软"隔离 —— 身份仍然只是 cookie，不是账号；提取码明文存在
+   -data 里（该目录不对外提供），换来的通行证是 HMAC 签名的 cookie，服务端不存状态、
+   重启即作废（重新输一次码即可）。 */
+const CODE_ALPHABET = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';   // 去掉 0/O/1/I/L 这些容易看错的
+const CODE_LEN = 6;
+function makeCode() {
+  const b = crypto.randomBytes(CODE_LEN);
+  let s = '';
+  for (let i = 0; i < CODE_LEN; i++) s += CODE_ALPHABET[b[i] % CODE_ALPHABET.length];
+  return s;
+}
+function isPrivateEntry(m) { return !!m && m.vis === 'private'; }
+function isEncEntry(m) { return !!(m && m.enc); }
+function displayNameOf(rel, m) { return (m && m.name) || path.basename(rel); }
+
+const UNLOCK_COOKIE = 'lan_ok';
+const UNLOCK_SECRET = crypto.randomBytes(32);
+const UNLOCK_TTL = 7 * 24 * 3600 * 1000;
+const UNLOCK_MAX = 200;                                    // 一张通行证最多记这么多文件，别撑爆 cookie
+function signUnlock(rels) {
+  const payload = Buffer.from(JSON.stringify({ r: rels.slice(0, UNLOCK_MAX), e: Date.now() + UNLOCK_TTL }), 'utf8').toString('base64url');
+  const mac = crypto.createHmac('sha256', UNLOCK_SECRET).update(payload).digest('base64url');
+  return payload + '.' + mac;
+}
+function readUnlocked(req) {
+  const raw = parseCookies(req)[UNLOCK_COOKIE] || '';
+  const dot = raw.lastIndexOf('.');
+  if (dot <= 0) return new Set();
+  const payload = raw.slice(0, dot), mac = raw.slice(dot + 1);
+  const want = crypto.createHmac('sha256', UNLOCK_SECRET).update(payload).digest('base64url');
+  const a = Buffer.from(mac), b = Buffer.from(want);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return new Set();
+  try {
+    const o = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+    if (!o || !Array.isArray(o.r) || !(o.e > Date.now())) return new Set();
+    return new Set(o.r.map(String));
+  } catch { return new Set(); }
+}
+function codeMatches(a, b) {
+  const x = Buffer.from(String(a || '').trim().toUpperCase()), y = Buffer.from(String(b || '').trim().toUpperCase());
+  return x.length > 0 && x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+// 这个浏览器能不能看到这个文件：公开的都能；私有的只有所有者、服务器本机、或兑换过提取码的
+function canSeeFile(rel, m, meId, ip, unlocked) {
+  if (!isPrivateEntry(m)) return true;
+  if (isHostSelf(ip)) return true;
+  if (ownerOk(m, meId, ip)) return true;
+  return !!(unlocked && unlocked.has(rel));
+}
+
 function todayFolder() {
   const d = new Date(), p = n => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
@@ -369,7 +437,13 @@ function safeRel(rel) {
 /* ---------- 元数据 ---------- */
 function readMeta() { try { return JSON.parse(fs.readFileSync(META, 'utf8')) || {}; } catch { return {}; } }
 function writeMeta(m) { try { fs.writeFileSync(META, JSON.stringify(m)); } catch {} }
-function setFileMeta(rel, ip, id) { const m = readMeta(); m[rel] = { id: id || '', ip, t: Date.now() }; writeMeta(m); }
+// extra 里的字段（name / vis / enc / code）会一起存进去；重复调用时保留已有字段，
+// 免得重命名或改可见范围的过程中把 enc、提取码这些信息冲掉。
+function setFileMeta(rel, ip, id, extra) {
+  const m = readMeta();
+  m[rel] = Object.assign({}, m[rel], { id: id || '', ip, t: Date.now() }, extra || {});
+  writeMeta(m);
+}
 
 /* ---------- 文本便签 ---------- */
 function readNotes() {
@@ -426,9 +500,11 @@ function readBody(req, limit) {
 }
 
 /* ---------- 文件清单 ---------- */
-function listFiles() {
+// 先遍历出磁盘上的全部文件（元数据清理必须基于"全部"，见下面的 valid），
+// 再按可见范围过滤出这台设备能看到的：私有文件对别人连存在性都不暴露。
+function listFiles(meId, ip, unlocked) {
   const meta = readMeta();
-  const out = [];
+  const all = [];
   const walk = (dir, relDir, depth) => {
     // 12 层：文件/<日期>/<上传文件夹…>/<文件> 最多 1+1+8+1，留点余量
     if (depth > 12) return;
@@ -441,10 +517,29 @@ function listFiles() {
       if (e.isDirectory()) { if (stillInside(full)) walk(full, rel, depth + 1); continue; }   // 不跟进链接
       if (!e.isFile()) continue;
       let st; try { st = fs.statSync(full); } catch { continue; }
-      out.push({ rel, folder: relDir, name: e.name, size: st.size, mtime: st.mtimeMs, ip: (meta[rel] || {}).ip || '', id: (meta[rel] || {}).id || '' });
+      const m = meta[rel] || {};
+      const mine = isHostSelf(ip) || ownerOk(m, meId, ip);
+      all.push({
+        rel, folder: relDir, disk: e.name,
+        name: displayNameOf(rel, m),
+        size: st.size, mtime: st.mtimeMs,
+        ip: m.ip || '', id: m.id || '',
+        vis: isPrivateEntry(m) ? 'private' : 'public',
+        enc: isEncEntry(m),
+        mine,
+        code: mine && m.code ? String(m.code) : '',        // 提取码只回给所有者
+        visible: canSeeFile(rel, m, meId, ip, unlocked)
+      });
     }
   };
   walk(ROOT, '', 1);
+  // 元数据里指向已消失文件的键要清掉。必须拿 all（含不可见的）来算，
+  // 否则当前这个浏览器看不到的私有文件，记录会被顺手删掉。
+  const valid = new Set(all.map(x => x.rel));
+  let changed = false;
+  for (const k of Object.keys(meta)) if (!valid.has(k)) { delete meta[k]; changed = true; }
+  if (changed) writeMeta(meta);
+  const out = all.filter(x => x.visible);
   // 分组顺序：快捷文本置顶；其余按日期倒序（最近的在上）；组内按修改时间倒序
   out.sort((a, b) => {
     const ra = a.folder === DIR_TEXT ? 0 : 1, rb = b.folder === DIR_TEXT ? 0 : 1;
@@ -452,10 +547,6 @@ function listFiles() {
     if (a.folder === b.folder) return b.mtime - a.mtime;
     return a.folder > b.folder ? -1 : 1;
   });
-  const valid = new Set(out.map(x => x.rel));
-  let changed = false;
-  for (const k of Object.keys(meta)) if (!valid.has(k)) { delete meta[k]; changed = true; }
-  if (changed) writeMeta(meta);
   return out;
 }
 
@@ -479,8 +570,286 @@ function kindLabel(n) {
   return e.slice(0, 4);
 }
 
+const CLIENT_CRYPTO_SRC = String.raw`
+/* ==================== 浏览器端加密模块（原样内联进页面） ====================
+   为什么不用 WebCrypto：http://192.168.x.x 不是"安全上下文"，crypto.subtle 在那种页面上
+   直接是 undefined —— 而这正是本工具最主要的用法（手机扫局域网地址进来）。所以这里用纯 JS
+   实现 ChaCha20-Poly1305（RFC 8439）+ PBKDF2-HMAC-SHA256，任何来源都能跑；随机数用
+   crypto.getRandomValues（它不受安全上下文限制）。
+   正确性：与 OpenSSL（node:crypto）逐项比对 sha256/hmac/pbkdf2/ChaCha20/Poly1305/AEAD，
+   并核对 RFC 8439 §2.8.2 官方向量 —— 见外侧的 _lan_test/test-crypto.js。
+   注意：这段会被塞进模板字符串，所以不能出现反引号或美元花括号插值语法。
+   文件格式：64 字节头（magic/版本/KDF/算法/迭代次数/盐/分块大小/IV 前缀/明文长度）+
+   逐块 ChaCha20-Poly1305（明文块 + 16 字节 tag），块号同时进 nonce 和 AAD，抗乱序与截断。 */
+var LSENC = (function () {
+  'use strict';
+  var HEADER_LEN = 64;
+  var KDF_PBKDF2 = 1;
+  var CIPHER_CHACHA20_POLY1305 = 2;
+  var DEFAULT_ITER = 150000;
+  var DEFAULT_CHUNK = 8 * 1024 * 1024;
+  var MAGIC = [0x4c, 0x53, 0x45, 0x4e, 0x43, 0x31, 0x00];   /* 'LSENC1\0' */
+
+  /* ================= SHA-256 ================= */
+  var K256 = new Uint32Array([
+    0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+    0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+    0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+    0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+    0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+    0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+    0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+    0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+  ]);
+  var H256 = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+  var W256 = new Uint32Array(64);
+
+  function sha256(msg) {
+    var len = msg.length;
+    var blocks = Math.ceil((len + 9) / 64);
+    var buf = new Uint8Array(blocks * 64);
+    buf.set(msg, 0);
+    buf[len] = 0x80;
+    var dv = new DataView(buf.buffer);
+    var bitsHi = Math.floor(len / 536870912);
+    var bitsLo = (len << 3) >>> 0;
+    dv.setUint32(blocks * 64 - 8, bitsHi, false);
+    dv.setUint32(blocks * 64 - 4, bitsLo, false);
+    var h0 = H256[0], h1 = H256[1], h2 = H256[2], h3 = H256[3], h4 = H256[4], h5 = H256[5], h6 = H256[6], h7 = H256[7];
+    for (var off = 0; off < blocks * 64; off += 64) {
+      var i;
+      for (i = 0; i < 16; i++) W256[i] = dv.getUint32(off + i * 4, false);
+      for (i = 16; i < 64; i++) {
+        var x = W256[i - 15], y = W256[i - 2];
+        var s0 = ((x >>> 7) | (x << 25)) ^ ((x >>> 18) | (x << 14)) ^ (x >>> 3);
+        var s1 = ((y >>> 17) | (y << 15)) ^ ((y >>> 19) | (y << 13)) ^ (y >>> 10);
+        W256[i] = (W256[i - 16] + s0 + W256[i - 7] + s1) | 0;
+      }
+      var a = h0, b = h1, c = h2, d = h3, e = h4, f = h5, g = h6, h = h7;
+      for (i = 0; i < 64; i++) {
+        var S1 = ((e >>> 6) | (e << 26)) ^ ((e >>> 11) | (e << 21)) ^ ((e >>> 25) | (e << 7));
+        var ch = (e & f) ^ (~e & g);
+        var t1 = (h + S1 + ch + K256[i] + W256[i]) | 0;
+        var S0 = ((a >>> 2) | (a << 30)) ^ ((a >>> 13) | (a << 19)) ^ ((a >>> 22) | (a << 10));
+        var maj = (a & b) ^ (a & c) ^ (b & c);
+        var t2 = (S0 + maj) | 0;
+        h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+      }
+      h0 = (h0 + a) | 0; h1 = (h1 + b) | 0; h2 = (h2 + c) | 0; h3 = (h3 + d) | 0;
+      h4 = (h4 + e) | 0; h5 = (h5 + f) | 0; h6 = (h6 + g) | 0; h7 = (h7 + h) | 0;
+    }
+    var out = new Uint8Array(32);
+    var odv = new DataView(out.buffer);
+    odv.setUint32(0, h0, false); odv.setUint32(4, h1, false); odv.setUint32(8, h2, false); odv.setUint32(12, h3, false);
+    odv.setUint32(16, h4, false); odv.setUint32(20, h5, false); odv.setUint32(24, h6, false); odv.setUint32(28, h7, false);
+    return out;
+  }
+
+  function concat(a, b) {
+    var out = new Uint8Array(a.length + b.length);
+    out.set(a, 0); out.set(b, a.length);
+    return out;
+  }
+  function hmac(key, msg) {
+    var k = key.length > 64 ? sha256(key) : key;
+    var ipad = new Uint8Array(64), opad = new Uint8Array(64);
+    ipad.set(k); opad.set(k);
+    for (var i = 0; i < 64; i++) { ipad[i] ^= 0x36; opad[i] ^= 0x5c; }
+    return sha256(concat(opad, sha256(concat(ipad, msg))));
+  }
+  function utf8(s) {
+    if (typeof TextEncoder !== 'undefined') return new TextEncoder().encode(s);
+    var out = [], i, c;
+    for (i = 0; i < s.length; i++) {
+      c = s.charCodeAt(i);
+      if (c < 0x80) out.push(c);
+      else if (c < 0x800) { out.push(0xc0 | (c >> 6), 0x80 | (c & 63)); }
+      else { out.push(0xe0 | (c >> 12), 0x80 | ((c >> 6) & 63), 0x80 | (c & 63)); }
+    }
+    return new Uint8Array(out);
+  }
+  function pbkdf2(password, salt, iter, dkLen) {
+    var pw = typeof password === 'string' ? utf8(password) : password;
+    var out = new Uint8Array(dkLen);
+    var blocks = Math.ceil(dkLen / 32);
+    for (var b = 1; b <= blocks; b++) {
+      var msg = new Uint8Array(salt.length + 4);
+      msg.set(salt, 0);
+      msg[salt.length] = (b >>> 24) & 255;
+      msg[salt.length + 1] = (b >>> 16) & 255;
+      msg[salt.length + 2] = (b >>> 8) & 255;
+      msg[salt.length + 3] = b & 255;
+      var u = hmac(pw, msg);
+      var t = u.slice(0);
+      for (var i = 1; i < iter; i++) {
+        u = hmac(pw, u);
+        for (var j = 0; j < 32; j++) t[j] ^= u[j];
+      }
+      out.set(t.subarray(0, Math.min(32, dkLen - (b - 1) * 32)), (b - 1) * 32);
+    }
+    return out;
+  }
+
+  /* ================= ChaCha20（RFC 8439） ================= */
+  function rotl(v, n) { return ((v << n) | (v >>> (32 - n))) | 0; }
+  function chachaBlock(key, nonce, counter, out, off) {
+    var s = new Uint32Array(16);
+    s[0] = 0x61707865; s[1] = 0x3320646e; s[2] = 0x79622d32; s[3] = 0x6b206574;
+    for (var i = 0; i < 8; i++) s[4 + i] = (key[i * 4] | (key[i * 4 + 1] << 8) | (key[i * 4 + 2] << 16) | (key[i * 4 + 3] << 24)) | 0;
+    s[12] = counter | 0;
+    s[13] = (nonce[0] | (nonce[1] << 8) | (nonce[2] << 16) | (nonce[3] << 24)) | 0;
+    s[14] = (nonce[4] | (nonce[5] << 8) | (nonce[6] << 16) | (nonce[7] << 24)) | 0;
+    s[15] = (nonce[8] | (nonce[9] << 8) | (nonce[10] << 16) | (nonce[11] << 24)) | 0;
+    var x = new Int32Array(16);
+    for (i = 0; i < 16; i++) x[i] = s[i];
+    function qr(a, b, c, d) {
+      x[a] = (x[a] + x[b]) | 0; x[d] = rotl(x[d] ^ x[a], 16);
+      x[c] = (x[c] + x[d]) | 0; x[b] = rotl(x[b] ^ x[c], 12);
+      x[a] = (x[a] + x[b]) | 0; x[d] = rotl(x[d] ^ x[a], 8);
+      x[c] = (x[c] + x[d]) | 0; x[b] = rotl(x[b] ^ x[c], 7);
+    }
+    for (var r = 0; r < 10; r++) {
+      qr(0, 4, 8, 12); qr(1, 5, 9, 13); qr(2, 6, 10, 14); qr(3, 7, 11, 15);
+      qr(0, 5, 10, 15); qr(1, 6, 11, 12); qr(2, 7, 8, 13); qr(3, 4, 9, 14);
+    }
+    var dv = new DataView(out.buffer, out.byteOffset + off, 64);
+    for (i = 0; i < 16; i++) dv.setUint32(i * 4, (x[i] + s[i]) | 0, true);
+  }
+  /* 用 ChaCha20 的密钥流异或一段数据；counter 指起始块号 */
+  function chachaXor(key, nonce, counter, data) {
+    var out = new Uint8Array(data.length);
+    var ks = new Uint8Array(64);
+    for (var off = 0; off < data.length; off += 64) {
+      chachaBlock(key, nonce, counter + (off / 64), ks, 0);
+      var n = Math.min(64, data.length - off);
+      for (var i = 0; i < n; i++) out[off + i] = data[off + i] ^ ks[i];
+    }
+    return out;
+  }
+
+  /* ================= Poly1305（用 BigInt 做 130 位运算） ================= */
+  var CLAMP = BigInt('0x0ffffffc0ffffffc0ffffffc0fffffff');
+  var P1305 = (BigInt(1) << BigInt(130)) - BigInt(5);
+  function leToBig(bytes) {
+    var v = BigInt(0);
+    for (var i = bytes.length - 1; i >= 0; i--) v = (v << BigInt(8)) | BigInt(bytes[i]);
+    return v;
+  }
+  function bigToLe(v, n) {
+    var out = new Uint8Array(n);
+    for (var i = 0; i < n; i++) { out[i] = Number(v & BigInt(255)); v >>= BigInt(8); }
+    return out;
+  }
+  function poly1305(msg, key) {
+    var r = leToBig(key.subarray(0, 16)) & CLAMP;
+    var s = leToBig(key.subarray(16, 32));
+    var acc = BigInt(0);
+    for (var i = 0; i < msg.length; i += 16) {
+      var end = Math.min(i + 16, msg.length);
+      var n = leToBig(msg.subarray(i, end)) + (BigInt(1) << BigInt(8 * (end - i)));
+      acc = ((acc + n) * r) % P1305;
+    }
+    return bigToLe((acc + s) & ((BigInt(1) << BigInt(128)) - BigInt(1)), 16);
+  }
+  function pad16(n) { return (16 - (n % 16)) % 16; }
+  function le64(n) {
+    var b = new Uint8Array(8);
+    var v = BigInt(n);
+    for (var i = 0; i < 8; i++) { b[i] = Number(v & BigInt(255)); v >>= BigInt(8); }
+    return b;
+  }
+  /* AEAD 构造：Poly1305 的输入 = aad || pad || ct || pad || len(aad) || len(ct)（都是小端） */
+  function macData(aad, ct) {
+    var parts = [aad, new Uint8Array(pad16(aad.length)), ct, new Uint8Array(pad16(ct.length)), le64(aad.length), le64(ct.length)];
+    var total = 0, i;
+    for (i = 0; i < parts.length; i++) total += parts[i].length;
+    var out = new Uint8Array(total), off = 0;
+    for (i = 0; i < parts.length; i++) { out.set(parts[i], off); off += parts[i].length; }
+    return out;
+  }
+  function aeadSeal(key, nonce, aad, plain) {
+    var polyKey = chachaXor(key, nonce, 0, new Uint8Array(64)).subarray(0, 32);
+    var ct = chachaXor(key, nonce, 1, plain);
+    return { ct: ct, tag: poly1305(macData(aad, ct), polyKey) };
+  }
+  function aeadOpen(key, nonce, aad, ct, tag) {
+    var polyKey = chachaXor(key, nonce, 0, new Uint8Array(64)).subarray(0, 32);
+    var want = poly1305(macData(aad, ct), polyKey);
+    var diff = 0;
+    for (var i = 0; i < 16; i++) diff |= want[i] ^ tag[i];
+    if (diff !== 0) throw new Error('bad-tag');
+    return chachaXor(key, nonce, 1, ct);
+  }
+
+  /* ================= 文件格式 ================= */
+  function chunkNonce(ivPrefix, idx) {
+    var n = new Uint8Array(12);
+    n.set(ivPrefix, 0);
+    var v = BigInt(idx);
+    for (var i = 0; i < 8; i++) { n[4 + i] = Number(v & BigInt(255)); v >>= BigInt(8); }
+    return n;
+  }
+  function chunkAad(idx) { return le64(idx); }
+  function packHeader(o) {
+    var b = new Uint8Array(HEADER_LEN);
+    for (var i = 0; i < MAGIC.length; i++) b[i] = MAGIC[i];
+    b[7] = 1; b[8] = KDF_PBKDF2; b[9] = CIPHER_CHACHA20_POLY1305;
+    var dv = new DataView(b.buffer);
+    dv.setUint32(12, o.iter, true);
+    b.set(o.salt, 16);
+    dv.setUint32(32, o.chunkSize, true);
+    b.set(o.ivPrefix, 36);
+    var v = BigInt(o.plainSize);
+    for (i = 0; i < 8; i++) { b[40 + i] = Number(v & BigInt(255)); v >>= BigInt(8); }
+    return b;
+  }
+  function parseHeader(b0) {
+    var b = b0 instanceof Uint8Array ? b0 : new Uint8Array(b0);
+    if (b.length < HEADER_LEN) throw new Error('文件头不完整');
+    for (var i = 0; i < MAGIC.length; i++) if (b[i] !== MAGIC[i]) throw new Error('不是加密文件');
+    if (b[7] !== 1) throw new Error('版本不支持');
+    var dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+    return {
+      kdf: b[8], cipher: b[9],
+      iter: dv.getUint32(12, true),
+      salt: b.slice(16, 32),
+      chunkSize: dv.getUint32(32, true),
+      ivPrefix: b.slice(36, 40),
+      plainSize: leToBig(b.subarray(40, 48))
+    };
+  }
+  function rand(n) { return crypto.getRandomValues(new Uint8Array(n)); }
+  function encChunkCount(plainSize, chunkSize) {
+    var p = BigInt(plainSize), c = BigInt(chunkSize);
+    var n = (p + c - BigInt(1)) / c;
+    return Number(n < BigInt(1) ? BigInt(1) : n);
+  }
+  /* 加密一块（供分块上传用）：返回 { ct, tag, done } */
+  function sealChunk(key, ivPrefix, idx, bytes) {
+    var r = aeadSeal(key, chunkNonce(ivPrefix, idx), chunkAad(idx), bytes);
+    var out = new Uint8Array(r.ct.length + 16);
+    out.set(r.ct, 0); out.set(r.tag, r.ct.length);
+    return out;
+  }
+  function openChunk(key, ivPrefix, idx, bytes) {
+    if (bytes.length < 16) throw new Error('密文块损坏');
+    var ct = bytes.subarray(0, bytes.length - 16), tag = bytes.subarray(bytes.length - 16);
+    return aeadOpen(key, chunkNonce(ivPrefix, idx), chunkAad(idx), ct, tag);
+  }
+  return {
+    HEADER_LEN: HEADER_LEN, DEFAULT_ITER: DEFAULT_ITER, DEFAULT_CHUNK: DEFAULT_CHUNK,
+    CIPHER_CHACHA20_POLY1305: CIPHER_CHACHA20_POLY1305,
+    sha256: sha256, hmac: hmac, pbkdf2: pbkdf2,
+    chachaXor: chachaXor, poly1305: poly1305, aeadSeal: aeadSeal, aeadOpen: aeadOpen,
+    packHeader: packHeader, parseHeader: parseHeader, rand: rand,
+    encChunkCount: encChunkCount, sealChunk: sealChunk, openChunk: openChunk,
+    chunkNonce: chunkNonce, chunkAad: chunkAad
+  };
+})();
+`;
+
 /* ---------- 页面 ---------- */
-function fileGroupHtml(files, me, meIp) {
+function fileGroupHtml(files) {
   if (!files.length) {
     return READONLY
       ? `<div class="empty"><div class="eicon">📭</div><div class="etitle">还没有文件</div>
@@ -505,25 +874,26 @@ function fileGroupHtml(files, me, meIp) {
     const rows = g.list.map(f => {
       const d = new Date(f.mtime);
       const ts = `${d.getFullYear()}-${p2(d.getMonth() + 1)}-${p2(d.getDate())} ${p2(d.getHours())}:${p2(d.getMinutes())}`;
-      const segs = f.folder.split('/').filter(Boolean).concat([f.name]);
-      const rel = segs.join('/');
-      const href = '/f/' + segs.map(encodeURIComponent).join('/');
-      const imgUrl = '/i/' + segs.map(encodeURIComponent).join('/');
-      const kind = kindOf(f.name);
-      const isMedia = kind === 'video' || kind === 'audio';
-      const thumb = isImg(f.name)
+      const urlSegs = f.rel.split('/').map(encodeURIComponent).join('/');   // 链接一律用磁盘上的真实路径
+      const href = '/f/' + urlSegs;
+      const imgUrl = '/i/' + urlSegs;
+      const kind = kindOf(f.name);                       // 类型看显示名：加密文件的磁盘名是随机串
+      const isMedia = !f.enc && (kind === 'video' || kind === 'audio');
+      const thumb = (!f.enc && isImg(f.name))
         ? `<img class="thumb" src="${imgUrl}" data-img="${imgUrl}" loading="lazy" alt="">`
-        : `<span class="thumb ico">${isMedia ? (kind === 'video' ? '▶' : '♪') : kindLabel(f.name)}</span>`;
+        : `<span class="thumb ico">${f.enc ? '🔐' : (isMedia ? (kind === 'video' ? '▶' : '♪') : kindLabel(f.name))}</span>`;
       const mediaAttr = isMedia
-        ? ` data-media="/m/${segs.map(encodeURIComponent).join('/')}" data-mkind="${kind}" title="${L('点一下在线播放', 'Click to play')}"`
+        ? ` data-media="/m/${urlSegs}" data-mkind="${kind}" title="${L('点一下在线播放', 'Click to play')}"`
         : '';
-      const canDel = !READONLY && (isHostSelf(meIp) || ownerOk(f, me, meIp));
-      const act = canDel
-        ? `<button class="btn ghost danger fdel" data-rel="${esc(rel)}" data-name="${esc(f.name)}" title="删除" aria-label="删除 ${esc(f.name)}">✕</button>`
-        : (READONLY ? '' : `<span class="editlock" title="只有上传者能删除">🔒</span>`);
-      return `<li class="frow" data-name="${esc(f.name.toLowerCase())}" data-rel="${esc(rel)}" data-kind="${kind}" data-size="${f.size}"><input type="checkbox" class="selbox" aria-label="选择 ${esc(f.name)}"><a class="row" href="${href}"${mediaAttr}>
+      const tags = (f.vis === 'private' ? `<span class="tagon" title="${L('仅自己可见', 'Only you can see this')}">🔒</span>` : '')
+        + (f.enc ? `<span class="tagon" title="${L('浏览器端加密，需要密码', 'End-to-end encrypted - password required')}">🔐</span>` : '');
+      const act = f.mine && !READONLY
+        ? `<button class="btn ghost fgear" data-rel="${esc(f.rel)}" data-name="${esc(f.name)}" data-vis="${f.vis}" data-enc="${f.enc ? 1 : 0}" data-code="${esc(f.code)}" data-size="${f.size}" data-note="${f.folder === DIR_TEXT ? 1 : 0}" title="${L('设置', 'Settings')}" aria-label="${L('设置', 'Settings')} ${esc(f.name)}">⚙</button>`
+          + `<button class="btn ghost danger fdel" data-rel="${esc(f.rel)}" data-name="${esc(f.name)}" title="删除" aria-label="删除 ${esc(f.name)}">✕</button>`
+        : (READONLY ? '' : `<span class="editlock" title="${L('只有上传者能删除', 'Only the uploader can delete')}">🔒</span>`);
+      return `<li class="frow" data-name="${esc(f.name.toLowerCase())}" data-disp="${esc(f.name)}" data-rel="${esc(f.rel)}" data-kind="${kind}" data-size="${f.size}"${f.enc ? ' data-enc="1"' : ''}><input type="checkbox" class="selbox" aria-label="选择 ${esc(f.name)}"><a class="row" href="${href}"${mediaAttr}>
   ${thumb}
-  <span class="mid"><span class="nm">${esc(f.name)}</span><span class="meta">${esc(f.ip || '未记录')} · ${ts}</span></span>
+  <span class="mid"><span class="nm">${esc(f.name)}${tags}</span><span class="meta">${esc(f.ip || '未记录')} · ${ts}</span></span>
   <span class="sz">${human(f.size)}</span>
 </a>${act}</li>`;
     }).join('');
@@ -534,7 +904,7 @@ function fileGroupHtml(files, me, meIp) {
   }).join('');
 }
 
-function page(files, me, meIp) {
+function page(files, meIp) {
   const free = freeBytes();
 
   return `<!doctype html><html lang="${LANG === 'en' ? 'en' : 'zh-CN'}"><head>
@@ -655,6 +1025,40 @@ function page(files, me, meIp) {
  li.frow{display:flex;align-items:center;gap:8px}
  .fdel{flex:0 0 auto;padding:9px 13px;border-radius:11px;font-size:14px;line-height:1}
  .editlock{flex:0 0 auto;padding:9px 10px;font-size:14px;opacity:.4;user-select:none}
+ /* 设置（⚙）只出现在自己传的文件上；🔒/🔐 是小小的一行标记，别抢文件名的地方 */
+ .fgear{flex:0 0 auto;padding:9px 11px;border-radius:11px;font-size:14px;line-height:1}
+ .tagon{font-size:11px;margin-left:5px;opacity:.85;white-space:nowrap}
+ /* 待上传列表：选好文件后先在这里逐个设置，再统一上传 */
+ .stage{margin-top:12px}
+ .scard{background:var(--card);border:1px solid var(--line);border-radius:12px;box-shadow:var(--shadow);padding:11px 12px;margin-bottom:8px}
+ .stop{display:flex;align-items:center;gap:8px}
+ .snm{flex:1;min-width:0;font-weight:600;font-size:14px;word-break:break-all}
+ .ssz{color:var(--muted);font-size:12px;white-space:nowrap}
+ .scfg{display:grid;grid-template-columns:1fr 1fr;gap:9px;margin-top:9px}
+ .scfg .wide{grid-column:1/-1}
+ .slab{font-size:12px;color:var(--muted);display:block;margin-bottom:3px}
+ .sin{width:100%;padding:8px 10px;border:1px solid var(--line);border-radius:9px;background:var(--bg);
+   color:inherit;font:13.5px inherit;outline:none;box-sizing:border-box}
+ .sin:focus{border-color:var(--accent)}
+ .sck{display:flex;align-items:center;gap:7px;font-size:13px;color:var(--muted);margin:5px 0}
+ .sck input{width:16px;height:16px;accent-color:var(--accent);flex:0 0 auto}
+ .spw{margin-top:7px}
+ .spw .sin{margin-bottom:6px}
+ .shint{font-size:12px;color:var(--muted);margin-top:5px}
+ select.sin{font:13.5px inherit}
+ .stagebar{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+ .stagebar .sp{flex:1}
+ /* 对话框（提取码 / 文件设置 / 解密）沿用 .mdl 的壳子，只是内容宽一点、左对齐 */
+ .mdlbox.wide{max-width:520px;text-align:left}
+ .mdlbox.wide h3{margin-bottom:10px}
+ .fld{margin:11px 0}
+ .dlgmsg{font-size:13px;color:var(--muted);margin-top:9px;min-height:18px;word-break:break-all}
+ .dlgnote{font-size:12.5px;color:var(--muted);margin:8px 0;line-height:1.55}
+ .coderow{display:flex;align-items:center;gap:8px;margin:6px 0;flex-wrap:wrap}
+ .codename{flex:1;min-width:110px;font-size:13.5px;word-break:break-all}
+ .progbar{height:6px;background:var(--bg);border-radius:99px;overflow:hidden;margin-top:10px}
+ .progbar i{display:block;height:100%;width:0;background:var(--accent);transition:width .18s}
+ @media (max-width:430px){ .scfg{grid-template-columns:1fr} }
  li.frow .row{flex:1;min-width:0;display:flex;align-items:center;gap:12px;padding:11px 13px;
    text-decoration:none;color:inherit;background:var(--card);border:1px solid var(--line);
    border-radius:12px;box-shadow:var(--shadow);transition:.15s}
@@ -699,6 +1103,8 @@ function page(files, me, meIp) {
    -webkit-box-orient:vertical;overflow:hidden}
  #filelist.grid .sz{font-size:11px;text-align:center}
  #filelist.grid .fdel{position:absolute;top:5px;right:5px;padding:4px 8px;font-size:12px;border:0;
+   background:rgba(0,0,0,.5);color:#fff;backdrop-filter:blur(4px)}
+ #filelist.grid .fgear{position:absolute;top:5px;right:34px;padding:4px 7px;font-size:12px;border:0;
    background:rgba(0,0,0,.5);color:#fff;backdrop-filter:blur(4px)}
  #filelist.grid .fdel.arm{background:var(--danger);color:#fff}
  .notebox{display:flex;flex-direction:column;gap:9px}
@@ -809,6 +1215,7 @@ function page(files, me, meIp) {
     <div class="hright">
       ${free === undefined ? '' : `<span class="chip">💾 可用 <b>${human(free)}</b></span>`}
       <button class="lkbtn" id="lkBtn" title="${L('手机怎么连进来', 'How to open this from a phone')}">${L('🔗 接入', '🔗 Connect')}</button>
+      <button class="btn ghost mini" id="unBtn" title="${L('输入提取码，解锁别人设成「仅自己可见」的文件', 'Enter an extract code to unlock a private file someone shared with you')}">🔑 ${L('提取码', 'Code')}</button>
     </div>
   </header>
 ${READONLY ? `
@@ -846,6 +1253,14 @@ ${READONLY ? `
       <input id="dir" type="file" webkitdirectory directory multiple hidden>
       <button class="btn ghost mini" id="pickDir" type="button">${L('或选整个文件夹', 'or pick a whole folder')}</button>
     </div>
+    <div class="stage ro-hide" id="stage" hidden>
+      <div class="stagebar">
+        <span class="tbinfo" id="stageInfo"></span>
+        <button class="btn ghost mini" id="stageClear" type="button">${L('清空', 'Clear')}</button>
+        <button class="btn mini" id="stageGo" type="button">${L('开始上传', 'Upload')}</button>
+      </div>
+      <div id="stageList"></div>
+    </div>
     <div class="prog" id="prog"></div>
 
     <div class="toolbar">
@@ -857,7 +1272,7 @@ ${READONLY ? `
     </div>
 
     <div id="filelist">
-      ${fileGroupHtml(files, me, meIp)}
+      ${fileGroupHtml(files)}
     </div>
     <div id="noHit" class="empty" hidden><div class="eicon">🔍</div><div class="etitle">没有匹配的内容</div></div>
   </section>
@@ -890,6 +1305,87 @@ ${READONLY ? `
   </div>
 </div>
 
+<div class="mdl" id="undlg" hidden>
+  <div class="mdlbox wide" role="dialog" aria-modal="true" aria-label="${L('输入提取码', 'Enter extract code')}">
+    <h3>🔑 ${L('输入提取码', 'Enter extract code')}</h3>
+    <div class="dlgnote">${L('别人把文件设成「仅自己可见」时会拿到一个提取码。输进去，这个浏览器就能看到那个文件（换设备要重输）。',
+      'A file set to "only me" comes with an extract code. Enter it here and this browser can see that file.')}</div>
+    <input id="unCode" class="sin" type="text" autocomplete="off" spellcheck="false" placeholder="${L('例如 K7M2QP', 'e.g. K7M2QP')}">
+    <div class="dlgmsg" id="unMsg"></div>
+    <div class="mdlrow">
+      <button class="btn ghost mini" id="unClose" type="button">${L('关闭', 'Close')}</button>
+      <button class="btn mini" id="unGo" type="button">${L('兑换', 'Unlock')}</button>
+    </div>
+  </div>
+</div>
+
+<div class="mdl" id="setdlg" hidden>
+  <div class="mdlbox wide" role="dialog" aria-modal="true" aria-label="${L('文件设置', 'File settings')}">
+    <h3>⚙ ${L('文件设置', 'File settings')}</h3>
+    <div class="fld">
+      <span class="slab">${L('文件名（重命名）', 'Name (rename)')}</span>
+      <input id="setName" class="sin" type="text" autocomplete="off">
+    </div>
+    <div class="fld">
+      <span class="slab">${L('可见范围', 'Visibility')}</span>
+      <label class="sck"><input type="radio" name="setVis" id="setVisPub"> ${L('所有人可见', 'Everyone')}</label>
+      <label class="sck"><input type="radio" name="setVis" id="setVisPriv"> ${L('仅自己可见（生成提取码）', 'Only me (generates an extract code)')}</label>
+    </div>
+    <div class="fld" id="setCodeRow">
+      <span class="slab">${L('提取码：发给别人，他们输入后就能看到这个文件', 'Extract code: share it and others can see this file')}</span>
+      <div class="coderow">
+        <span class="codebox" id="setCode">—</span>
+        <button class="btn ghost mini" id="setCopy" type="button">${L('复制', 'Copy')}</button>
+        <button class="btn ghost mini" id="setRotate" type="button">${L('换一个', 'New code')}</button>
+      </div>
+    </div>
+    <div class="dlgnote" id="setEncNote"></div>
+    <div class="fld" id="setEncRow">
+      <span class="slab">${L('把已上传的文件也加密', 'Encrypt this file too')}</span>
+      <div class="dlgnote" style="margin:4px 0 8px">${L('先在浏览器里加密，再把密文上传，最后删掉原文件（中途磁盘上会短暂地同时存在两份）。加密后的文件会落在今天的文件夹里。',
+        'Encrypt in this browser, upload the ciphertext, then delete the original (both exist briefly). The encrypted copy lands in the folder dated today.')}</div>
+      <button class="btn ghost mini" id="setEncBtn" type="button">🔐 ${L('加密此文件', 'Encrypt this file')}</button>
+      <div id="setEncBox" hidden>
+        <input id="setEncPw" class="sin" type="password" autocomplete="new-password" placeholder="${L('新密码（丢了就打不开）', 'New password (unrecoverable)')}" style="margin-top:8px">
+        <input id="setEncPw2" class="sin" type="password" autocomplete="new-password" placeholder="${L('再输一次', 'Repeat it')}" style="margin-top:6px">
+        <div class="dlgmsg" id="setEncMsg"></div>
+        <button class="btn mini" id="setEncGo" type="button" style="margin-top:6px">${L('开始加密', 'Encrypt now')}</button>
+      </div>
+    </div>
+    <div class="dlgmsg" id="setMsg"></div>
+    <div class="mdlrow">
+      <button class="btn ghost mini" id="setClose" type="button">${L('关闭', 'Close')}</button>
+      <button class="btn mini" id="setSave" type="button">${L('保存', 'Save')}</button>
+    </div>
+  </div>
+</div>
+
+<div class="mdl" id="decdlg" hidden>
+  <div class="mdlbox wide" role="dialog" aria-modal="true" aria-label="${L('解密下载', 'Decrypt and download')}">
+    <h3 id="decTitle">🔐 ${L('解密下载', 'Decrypt and download')}</h3>
+    <div class="dlgnote">${L('这个文件在服务器上是密文。密码只在这个浏览器里用，不会发出去；解密完成后直接存成原文件，服务器上留下的还是密文。',
+      'The server only holds the ciphertext. Your password is used in this browser and never sent; the file is saved locally under its real name.')}</div>
+    <input id="decPw" class="sin" type="password" autocomplete="off" placeholder="${L('文件密码', 'File password')}">
+    <div class="progbar" id="decBar"><i></i></div>
+    <div class="dlgmsg" id="decMsg"></div>
+    <div class="mdlrow">
+      <button class="btn ghost mini" id="decClose" type="button">${L('关闭', 'Close')}</button>
+      <button class="btn mini" id="decGo" type="button">${L('解密并下载', 'Decrypt')}</button>
+    </div>
+  </div>
+</div>
+
+<div class="mdl" id="codesdlg" hidden>
+  <div class="mdlbox wide" role="dialog" aria-modal="true" aria-label="${L('提取码', 'Extract codes')}">
+    <h3>🔑 ${L('提取码（现在就记下来）', 'Extract codes (save them now)')}</h3>
+    <div class="dlgnote">${L('这些文件设成了「仅自己可见」。把提取码发给别人，他们输进去就能看到并下载；自己在这个浏览器上一直能看到，也可以随时在 ⚙ 里查看和更换。',
+      'These files are private. Share a code and others can see that file; you can always see them in this browser, and review or rotate codes under the gear icon.')}</div>
+    <div id="codesList"></div>
+    <div class="mdlrow"><button class="btn mini" id="codesClose" type="button">${L('知道了', 'Got it')}</button></div>
+  </div>
+</div>
+
+<script>${CLIENT_CRYPTO_SRC}</script>
 <script>
 const $ = id => document.getElementById(id);
 const RO = ${READONLY ? 'true' : 'false'};        // 只读模式：写操作的入口都不渲染，这里再兜一层
@@ -1165,8 +1661,8 @@ const drop = $('drop'), inp = $('file'), dirInp = $('dir'), mask = $('mask');
 const droppedDirs = new WeakMap();                 // File -> '子目录/文件名'（拖进来的文件夹用）
 drop.addEventListener('click', () => { if (!RO) inp.click(); });
 $('pickDir').addEventListener('click', ev => { ev.preventDefault(); ev.stopPropagation(); if (!RO) dirInp.click(); });
-inp.addEventListener('change', () => { if (!RO) upload(Array.from(inp.files)); inp.value = ''; });
-dirInp.addEventListener('change', () => { if (!RO) upload(Array.from(dirInp.files)); dirInp.value = ''; });
+inp.addEventListener('change', () => { if (!RO) stageAdd(Array.from(inp.files)); inp.value = ''; });
+dirInp.addEventListener('change', () => { if (!RO) stageAdd(Array.from(dirInp.files)); dirInp.value = ''; });
 let dragDepth = 0;
 /* 拖进来的可能整个是文件夹：用 webkitGetAsEntry 递归读（entry 必须在事件里同步取，之后 items 就失效了） */
 function entriesOf(dt) {
@@ -1209,66 +1705,14 @@ window.addEventListener('drop', e => {
   if (RO || !e.dataTransfer) return;
   const dtFiles = e.dataTransfer.files ? Array.from(e.dataTransfer.files) : [];
   const entries = entriesOf(e.dataTransfer);
-  if (!entries) { if (dtFiles.length) upload(dtFiles); return; }
+  if (!entries) { if (dtFiles.length) stageAdd(dtFiles); return; }
   filesFromEntries(entries).then(list => {
-    if (list.length) upload(list);
-    else if (dtFiles.length) upload(dtFiles);
+    if (list.length) stageAdd(list);
+    else if (dtFiles.length) stageAdd(dtFiles);
   });
 });
 
-function upload(files){
-  if (RO || !files.length) return;
-  showTab('file');
-  let done = 0, failed = 0;
-  files.forEach(f => {
-    const row = document.createElement('div'); row.className = 'prow';
-    const top = document.createElement('div'); top.className = 'top';
-    const nm = document.createElement('span'); nm.className = 'nmx'; nm.textContent = f.name;
-    const pct = document.createElement('span'); pct.className = 'sz'; pct.textContent = '准备中…';
-    const bar = document.createElement('div'); bar.className = 'bar';
-    const fill = document.createElement('i');
-    bar.appendChild(fill);
-    top.appendChild(nm); top.appendChild(pct);
-    row.appendChild(top); row.appendChild(bar);
-    prog.appendChild(row);
-
-    const t0 = Date.now();
-    const x = new XMLHttpRequest();
-    const relp = droppedDirs.get(f) || f.webkitRelativePath || '';     // 拖进来的文件夹 / 选文件夹上传
-    const sub = relp ? relp.split('/').slice(0, -1).join('/') : '';
-    x.open('PUT', '/u/' + encodeURIComponent(f.name) + (sub ? '?dir=' + encodeURIComponent(sub) : ''));
-    x.upload.onprogress = e => {
-      if (!e.lengthComputable) return;
-      const p = Math.round(e.loaded / e.total * 100);
-      const dt = (Date.now() - t0) / 1000;
-      const sp = dt > 0.3 ? fmtSpeed(e.loaded / dt) : '';
-      pct.textContent = p + '%' + (sp ? ' · ' + sp : '');
-      fill.style.width = p + '%';
-    };
-    const finish = (ok, msg) => {
-      pct.textContent = msg;
-      pct.className = 'sz ' + (ok ? 'ok' : 'bad');
-      fill.style.width = '100%';
-      if (!ok) { fill.style.background = 'var(--danger)'; failed++; }
-      if (++done === files.length) {
-        toast(failed ? failed + ' 个文件上传失败' : '上传完成', !!failed);
-        setTimeout(async () => {
-          try {
-            await loadFiles();
-            await loadNotes();
-            prog.textContent = '';
-            applySort();
-            applyOpenState();
-            applyPicked();
-          } catch (e) {}
-        }, 700);
-      }
-    };
-    x.onload = () => finish(x.status < 300, x.status < 300 ? '✅ 完成' : (x.status === 403 ? ${JSON.stringify(L('🔒 只读模式', '🔒 Read-only'))} : '❌ ' + x.status));
-    x.onerror = () => finish(false, '❌ 网络错误');
-    x.send(f);
-  });
-}
+/* 真正的上传在页面末尾那段（脚本 2）里：先入待上传列表，设置好重命名/加密/可见范围再传 */
 
 /* ---------- 文件操作（删除改成二次点击确认，替掉原生 confirm） ---------- */
 let armedBtn = null, armTimer = 0;
@@ -1610,6 +2054,537 @@ async function syncRev(){
 setInterval(syncRev, 3000);
 syncRev();
 document.addEventListener('visibilitychange', () => { if (!document.hidden) syncRev(); });
+</script>
+<script>
+/* ============ 新功能：待上传设置 / 提取码 / 文件设置 / 浏览器端加解密 ============ */
+const ENC_WARN_BYTES = 384 * 1024 * 1024;
+const stageEl = $('stage'), stageListEl = $('stageList'), stageInfoEl = $('stageInfo');
+const staged = [];
+
+function mk(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined && text !== null) e.textContent = text;
+  return e;
+}
+function encHint(size) {
+  let s = '加密在本机浏览器里完成，密码不会发给服务器。';
+  if (size > ENC_WARN_BYTES) s += ' 文件不小（' + human(size) + '），纯 JS 加解密约 18 MB/s，要等一会儿。';
+  return s;
+}
+
+/* ---------- 待上传列表 ---------- */
+function stageAdd(files) {
+  if (RO || !files || !files.length) return;
+  showTab('file');
+  for (let i = 0; i < files.length; i++) {
+    const f = files[i];
+    const relp = droppedDirs.get(f) || f.webkitRelativePath || '';
+    const sub = relp ? relp.split('/').slice(0, -1).join('/') : '';
+    staged.push({ file: f, sub: sub, name: f.name, enc: false, pw: '', pw2: '', vis: 'public' });
+  }
+  stageEl.hidden = false;
+  renderStage();
+  toast('已加入 ' + files.length + ' 个文件，设置好再点「开始上传」');
+}
+
+function renderStage() {
+  stageListEl.textContent = '';
+  stageInfoEl.textContent = staged.length ? ('待上传 ' + staged.length + ' 个文件') : '';
+  const go = $('stageGo');
+  go.textContent = RO ? '开始上传' : ('开始上传 (' + staged.length + ')');
+  go.disabled = staged.length === 0;
+  if (!staged.length) { stageEl.hidden = true; return; }
+  staged.forEach(function (it) {
+    const card = mk('div', 'scard');
+    const top = mk('div', 'stop');
+    const nm = mk('span', 'snm', (it.sub ? it.sub + '/' : '') + it.name);
+    const sz = mk('span', 'ssz', human(it.file.size));
+    const rm = mk('button', 'btn ghost mini', '移除');
+    rm.type = 'button';
+    rm.onclick = function () { const i = staged.indexOf(it); if (i >= 0) staged.splice(i, 1); renderStage(); };
+    top.appendChild(nm); top.appendChild(sz); top.appendChild(rm);
+
+    const cfg = mk('div', 'scfg');
+    const c1 = mk('div');
+    c1.appendChild(mk('span', 'slab', '文件名（上传前重命名）'));
+    const nameIn = mk('input', 'sin');
+    nameIn.type = 'text'; nameIn.value = it.name; nameIn.autocomplete = 'off';
+    nameIn.oninput = function () { it.name = nameIn.value; nm.textContent = (it.sub ? it.sub + '/' : '') + it.name; };
+    c1.appendChild(nameIn);
+
+    const c2 = mk('div');
+    c2.appendChild(mk('span', 'slab', '可见范围'));
+    const vis = mk('select', 'sin');
+    [['public', '所有人可见'], ['private', '仅自己可见（生成提取码）']].forEach(function (p) {
+      const o = mk('option', null, p[1]); o.value = p[0]; vis.appendChild(o);
+    });
+    vis.value = it.vis;
+    vis.onchange = function () { it.vis = vis.value; };
+    c2.appendChild(vis);
+    cfg.appendChild(c1); cfg.appendChild(c2);
+
+    const c3 = mk('div', 'wide');
+    const ck = mk('label', 'sck');
+    const cb = mk('input'); cb.type = 'checkbox'; cb.checked = it.enc;
+    ck.appendChild(cb);
+    ck.appendChild(mk('span', null, '加密（密码不出浏览器，服务器只存密文）'));
+    const pwBox = mk('div', 'spw');
+    const pw1 = mk('input', 'sin'); pw1.type = 'password'; pw1.placeholder = '密码（丢了就打不开，没有找回）'; pw1.autocomplete = 'new-password';
+    const pw2 = mk('input', 'sin'); pw2.type = 'password'; pw2.placeholder = '再输一次'; pw2.autocomplete = 'new-password';
+    const showLb = mk('label', 'sck');
+    const showCb = mk('input'); showCb.type = 'checkbox';
+    showLb.appendChild(showCb); showLb.appendChild(mk('span', null, '显示密码'));
+    showCb.onchange = function () { const t = showCb.checked ? 'text' : 'password'; pw1.type = t; pw2.type = t; };
+    pw1.oninput = function () { it.pw = pw1.value; };
+    pw2.oninput = function () { it.pw2 = pw2.value; };
+    pwBox.appendChild(pw1); pwBox.appendChild(pw2); pwBox.appendChild(showLb);
+    pwBox.hidden = !it.enc;
+    const hint = mk('div', 'shint', it.enc ? encHint(it.file.size) : '');
+    cb.onchange = function () {
+      it.enc = cb.checked;
+      pwBox.hidden = !it.enc;
+      hint.textContent = it.enc ? encHint(it.file.size) : '';
+    };
+    c3.appendChild(ck); c3.appendChild(pwBox); c3.appendChild(hint);
+    cfg.appendChild(c3);
+
+    card.appendChild(top); card.appendChild(cfg);
+    stageListEl.appendChild(card);
+  });
+}
+$('stageClear').onclick = function () { staged.length = 0; renderStage(); };
+$('stageGo').onclick = function () { runUpload(); };
+
+/* ---------- 上传（明文直传 / 加密后传密文） ---------- */
+function putFile(name, body, query, onProgress) {
+  return new Promise(function (resolve, reject) {
+    const x = new XMLHttpRequest();
+    const t0 = Date.now();
+    x.open('PUT', '/u/' + encodeURIComponent(name) + query);
+    x.upload.onprogress = function (e) {
+      if (!e.lengthComputable || !onProgress) return;
+      const dt = (Date.now() - t0) / 1000;
+      onProgress(e.loaded / e.total, dt > 0.3 ? fmtSpeed(e.loaded / dt) : '');
+    };
+    x.onload = function () {
+      if (x.status >= 300) return reject(new Error(x.status === 403 && RO ? '只读模式' : ('HTTP ' + x.status)));
+      let j = null;
+      try { j = JSON.parse(x.responseText); } catch (e) {}
+      resolve(j || {});
+    };
+    x.onerror = function () { reject(new Error('网络错误')); };
+    x.send(body);
+  });
+}
+
+async function encryptBlob(file, pw, onProgress) {
+  if (typeof LSENC === 'undefined') throw new Error('加密模块没加载');
+  const iter = LSENC.DEFAULT_ITER, chunk = LSENC.DEFAULT_CHUNK;
+  const salt = LSENC.rand(16), ivPrefix = LSENC.rand(4);
+  onProgress(0, '派生密钥…（约 1 秒）');
+  await new Promise(function (r) { setTimeout(r, 30); });          // 先让上面的文字画出来
+  const key = LSENC.pbkdf2(pw, salt, iter, 32);
+  const total = file.size;
+  const n = LSENC.encChunkCount(total, chunk);
+  const parts = [LSENC.packHeader({ iter: iter, salt: salt, chunkSize: chunk, ivPrefix: ivPrefix, plainSize: total })];
+  for (let i = 0; i < n; i++) {
+    const slice = file.slice(i * chunk, Math.min(total, (i + 1) * chunk));
+    const buf = new Uint8Array(await slice.arrayBuffer());
+    parts.push(LSENC.sealChunk(key, ivPrefix, i, buf));
+    onProgress((i + 1) / n, null);
+  }
+  return new Blob(parts, { type: 'application/octet-stream' });
+}
+
+async function runUpload() {
+  if (RO || !staged.length) return;
+  const list = staged.slice();
+  for (let i = 0; i < list.length; i++) {
+    const it = list[i];
+    if (!it.name.trim()) return toast('文件名不能为空', true);
+    if (it.enc && !it.pw) return toast('「' + it.name + '」选了加密，但还没填密码', true);
+    if (it.enc && it.pw !== it.pw2) return toast('「' + it.name + '」两次输入的密码不一样', true);
+  }
+  staged.length = 0;
+  renderStage();
+  stageEl.hidden = true;
+  $('prog').textContent = '';
+  const jobs = list.map(function (it) {
+    const row = mk('div', 'prow');
+    const top = mk('div', 'top');
+    const nm = mk('span', 'nmx', (it.sub ? it.sub + '/' : '') + it.name);
+    const pct = mk('span', 'sz', '准备中…');
+    top.appendChild(nm); top.appendChild(pct);
+    const bar = mk('div', 'bar');
+    const fill = mk('i');
+    bar.appendChild(fill);
+    row.appendChild(top); row.appendChild(bar);
+    $('prog').appendChild(row);
+    return { it: it, pct: pct, fill: fill };
+  });
+  let failed = 0;
+  const codes = [];
+  for (let i = 0; i < jobs.length; i++) {
+    const j = jobs[i], it = j.it;
+    try {
+      let body = it.file, encFlag = '';
+      if (it.enc) {
+        j.pct.textContent = '准备加密…';
+        body = await encryptBlob(it.file, it.pw, function (p, msg) {
+          if (msg) { j.pct.textContent = msg; return; }
+          const pc = Math.round(p * 100);
+          j.pct.textContent = '加密 ' + pc + '%';
+          j.fill.style.width = pc + '%';
+        });
+        encFlag = '&enc=1';
+      }
+      const q = '?ren=' + encodeURIComponent(it.name)
+        + (it.sub ? '&dir=' + encodeURIComponent(it.sub) : '')
+        + (it.vis === 'private' ? '&vis=private' : '')
+        + encFlag;
+      const r = await putFile(it.file.name, body, q, function (p, speed) {
+        const pc = Math.round(p * 100);
+        j.pct.textContent = pc + '%' + (speed ? ' · ' + speed : '');
+        j.fill.style.width = pc + '%';
+      });
+      j.pct.textContent = '✅ 完成';
+      j.pct.className = 'sz ok';
+      j.fill.style.width = '100%';
+      if (r && r.code) codes.push({ name: r.name || it.name, code: r.code });
+    } catch (e) {
+      failed++;
+      j.pct.textContent = '❌ ' + ((e && e.message) || '失败');
+      j.pct.className = 'sz bad';
+      j.fill.style.width = '100%';
+      j.fill.style.background = 'var(--danger)';
+    }
+  }
+  toast(failed ? (failed + ' 个文件上传失败') : '上传完成', !!failed);
+  await loadFiles();
+  applySort(); applyOpenState(); applyPicked();
+  setTimeout(function () { $('prog').textContent = ''; }, 1500);
+  if (codes.length) showCodes(codes);
+}
+
+/* ---------- 解密下载（浏览器里分块解密后另存） ---------- */
+async function decryptDownload(rel, name, pw, onProgress) {
+  if (typeof LSENC === 'undefined') throw new Error('加密模块没加载');
+  const url = '/f/' + rel.split('/').map(encodeURIComponent).join('/');
+  const hr = await fetch(url, { headers: { Range: 'bytes=0-63' }, cache: 'no-store' });
+  if (!hr.ok) throw new Error('读取失败 ' + hr.status);
+  const h = LSENC.parseHeader(new Uint8Array(await hr.arrayBuffer()));
+  if (h.cipher !== LSENC.CIPHER_CHACHA20_POLY1305) throw new Error('不支持的加密格式');
+  const total = Number(h.plainSize);
+  const encChunk = h.chunkSize + 16;
+  const n = LSENC.encChunkCount(total, h.chunkSize);
+  const totalEnc = LSENC.HEADER_LEN + total + n * 16;
+  onProgress(0, '派生密钥…（约 1 秒）');
+  await new Promise(function (r) { setTimeout(r, 30); });
+  const key = LSENC.pbkdf2(pw, h.salt, h.iter, 32);
+  const parts = [];
+  for (let i = 0; i < n; i++) {
+    const start = LSENC.HEADER_LEN + i * encChunk;
+    const end = Math.min(totalEnc, start + encChunk) - 1;
+    const res = await fetch(url, { headers: { Range: 'bytes=' + start + '-' + end }, cache: 'no-store' });
+    if (!res.ok && res.status !== 206) throw new Error('读取失败 ' + res.status);
+    const piece = new Uint8Array(await res.arrayBuffer());
+    let pt;
+    try { pt = LSENC.openChunk(key, h.ivPrefix, i, piece); }
+    catch (e) { throw new Error('密码不对，或者文件已经损坏'); }
+    parts.push(pt);
+    onProgress((i + 1) / n, null);
+  }
+  const blob = new Blob(parts);
+  const burl = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = burl; a.download = name; a.style.display = 'none';
+  document.body.appendChild(a);
+  if (a.click) a.click();
+  setTimeout(function () { URL.revokeObjectURL(burl); if (a.parentNode) a.parentNode.removeChild(a); }, 120000);
+}
+
+/* ---------- 提取码兑换 ---------- */
+$('unBtn').onclick = function () { $('unCode').value = ''; $('unMsg').textContent = ''; $('undlg').hidden = false; $('unCode').focus(); };
+$('unClose').onclick = function () { $('undlg').hidden = true; };
+$('unGo').onclick = async function () {
+  const code = $('unCode').value.trim();
+  if (!code) return $('unCode').focus();
+  $('unGo').disabled = true;
+  $('unMsg').textContent = '兑换中…';
+  try {
+    const r = await fetch('/unlock', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: code }) });
+    const j = await r.json();
+    if (j && j.ok) {
+      $('unMsg').textContent = '已解锁 ' + j.count + ' 个文件';
+      await loadFiles(); applySort(); applyOpenState(); applyPicked();
+      toast('已解锁 ' + j.count + ' 个文件' + (j.count > 1 ? '（可能不止一条同码）' : ''));
+      setTimeout(function () { $('undlg').hidden = true; }, 600);
+    } else {
+      $('unMsg').textContent = '提取码不对，或者对应的文件已经不在了';
+    }
+  } catch (e) { $('unMsg').textContent = '兑换失败：' + e.message; }
+  $('unGo').disabled = false;
+};
+$('unCode').addEventListener('keydown', function (e) { if (e.key === 'Enter') $('unGo').click(); });
+
+/* ---------- 文件设置（重命名 / 可见范围 / 提取码 / 给已有文件加密） ---------- */
+let setRel = null;
+let setInfo = null;
+const ENC_INPLACE_MAX = 1024 * 1024 * 1024;      // 已上传文件再加密时，先整份拉进内存的上限
+function openSettings(btn) {
+  setRel = btn.getAttribute('data-rel');
+  const isEnc = btn.getAttribute('data-enc') === '1';
+  const isNote = btn.getAttribute('data-note') === '1';
+  setInfo = {
+    rel: setRel,
+    name: btn.getAttribute('data-name') || '',
+    vis: btn.getAttribute('data-vis') || 'public',
+    enc: isEnc,
+    size: Number(btn.getAttribute('data-size') || 0),
+    note: isNote
+  };
+  $('setName').value = setInfo.name;
+  $('setVisPub').checked = setInfo.vis !== 'private';
+  $('setVisPriv').checked = setInfo.vis === 'private';
+  $('setEncNote').textContent = isEnc
+    ? '这个文件是浏览器端加密的：服务器上只有密文，密码丢了谁也打不开（包括服务器）。加密文件在磁盘上是随机名，所以重命名只改显示名。'
+    : '加密只能在「上传前」选，或者用下面的「加密此文件」把已经传上来的这份就地加密。';
+  // 已经加密的、便签正文、只读模式、或者大得拉不进内存的，都不给再加密的入口
+  $('setEncRow').hidden = isEnc || isNote;
+  $('setEncBox').hidden = true;
+  $('setEncPw').value = '';
+  $('setEncPw2').value = '';
+  $('setEncMsg').textContent = '';
+  $('setEncGo').disabled = false;
+  setCode(btn.getAttribute('data-code') || '');
+  $('setMsg').textContent = '';
+  $('setSave').disabled = false;
+  $('setdlg').hidden = false;
+}
+function setCode(c) {
+  $('setCode').textContent = c || '—';
+  $('setCodeRow').hidden = !c;
+  $('setCopy').hidden = !c;
+  $('setRotate').hidden = !c;
+}
+async function patchFile(body) {
+  const r = await fetch('/f/' + setRel.split('/').map(encodeURIComponent).join('/'), {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+  });
+  let j = {};
+  try { j = await r.json(); } catch (e) {}
+  if (!r.ok || !j.ok) throw new Error((j && (j.message || j.error)) || ('HTTP ' + r.status));
+  return j;
+}
+$('setClose').onclick = function () { $('setdlg').hidden = true; };
+$('setCopy').onclick = function () { copyText($('setCode').textContent); };
+$('setSave').onclick = async function () {
+  if (!setRel) return;
+  $('setSave').disabled = true;
+  $('setMsg').textContent = '保存中…';
+  try {
+    const j = await patchFile({ name: $('setName').value, vis: $('setVisPriv').checked ? 'private' : 'public' });
+    setRel = j.rel;
+    setCode(j.code || '');
+    $('setMsg').textContent = j.vis === 'private'
+      ? ('已保存 · 提取码 ' + (j.code || '') + '（发给别人，他们输入后就能看到）')
+      : '已保存（所有人可见，原提取码已作废）';
+    await loadFiles(); applySort(); applyOpenState(); applyPicked();
+  } catch (e) { $('setMsg').textContent = '保存失败：' + e.message; }
+  $('setSave').disabled = false;
+};
+$('setRotate').onclick = async function () {
+  if (!setRel) return;
+  $('setMsg').textContent = '正在换码…';
+  try {
+    const j = await patchFile({ rotate: true });
+    setCode(j.code || '');
+    $('setMsg').textContent = '新提取码：' + j.code + '（旧的立刻失效）';
+    await loadFiles(); applySort(); applyOpenState(); applyPicked();
+  } catch (e) { $('setMsg').textContent = '换码失败：' + e.message; }
+};
+
+/* 把已经上传的文件就地加密：下载 → 浏览器里加密 → 上传密文 → 删原件。
+   先传后删是故意的：中途断了最多多留一份，不会丢东西。 */
+$('setEncBtn').onclick = function () {
+  if (!setInfo) return;
+  if (setInfo.enc || setInfo.note) return;
+  if (setInfo.size > ENC_INPLACE_MAX) {
+    $('setEncMsg').textContent = '这个文件有 ' + human(setInfo.size) + '，超过 1 GB 拉不进浏览器内存。请先下载到电脑上加密，再上传新文件。';
+    $('setEncBox').hidden = false;
+    $('setEncGo').disabled = true;
+    return;
+  }
+  $('setEncBox').hidden = false;
+  $('setEncGo').disabled = false;
+  $('setEncPw').focus();
+};
+$('setEncGo').onclick = async function () {
+  if (!setInfo || !setRel) return;
+  const info = setInfo;
+  const pw = $('setEncPw').value, pw2 = $('setEncPw2').value;
+  if (!pw) { $('setEncMsg').textContent = '先填一个密码'; return $('setEncPw').focus(); }
+  if (pw !== pw2) { $('setEncMsg').textContent = '两次输入的密码不一样'; return; }
+  $('setEncGo').disabled = true;
+  $('setSave').disabled = true;
+  const url = '/f/' + info.rel.split('/').map(encodeURIComponent).join('/');
+  try {
+    $('setEncMsg').textContent = '下载原文件…（' + human(info.size) + '）';
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok) throw new Error('下载失败 ' + res.status);
+    const raw = await res.blob();
+    $('setEncMsg').textContent = '加密中…';
+    const encBlob = await encryptBlob(new File([raw], info.name), pw, function (p, msg) {
+      if (msg) { $('setEncMsg').textContent = msg; return; }
+      $('setEncMsg').textContent = '加密 ' + Math.round(p * 100) + '%';
+    });
+    $('setEncMsg').textContent = '上传密文…';
+    const q = '?ren=' + encodeURIComponent(info.name) + (info.vis === 'private' ? '&vis=private' : '') + '&enc=1';
+    const up = await putFile(info.name, encBlob, q, function (p) {
+      $('setEncMsg').textContent = '上传 ' + Math.round(p * 100) + '%';
+    });
+    $('setEncMsg').textContent = '删除原文件…';
+    const del = await fetch(url, { method: 'DELETE' });
+    setRel = up.path || setRel;
+    setInfo = Object.assign({}, info, { rel: setRel, enc: true });
+    setCode(up.code || '');
+    $('setEncNote').textContent = '这个文件已经加密：服务器上只有密文，密码丢了谁也打不开（包括服务器）。';
+    $('setEncRow').hidden = true;
+    $('setMsg').textContent = del.ok
+      ? '加密完成，原文件已删除。新文件在「今天」的文件夹里。'
+      : '密文已经上传成功，但原文件没能删掉（' + del.status + '），可以手动删一次。';
+    if (up.code) $('setMsg').textContent += ' 新的提取码：' + up.code;
+    await loadFiles(); applySort(); applyOpenState(); applyPicked();
+    toast('已加密');
+  } catch (e) {
+    $('setEncMsg').textContent = '加密失败：' + e.message;
+  }
+  $('setEncGo').disabled = false;
+  $('setSave').disabled = false;
+};
+
+/* ---------- 解密对话框 ---------- */
+let decTarget = null;
+function openDecrypt(rel, name) {
+  decTarget = { rel: rel, name: name };
+  $('decTitle').textContent = '🔐 解密下载：' + name;
+  $('decPw').value = '';
+  $('decMsg').textContent = '';
+  $('decBar').firstElementChild.style.width = '0%';
+  $('decdlg').hidden = false;
+  $('decPw').focus();
+}
+$('decClose').onclick = function () { $('decdlg').hidden = true; };
+$('decGo').onclick = async function () {
+  if (!decTarget) return;
+  const pw = $('decPw').value;
+  if (!pw) return $('decPw').focus();
+  $('decGo').disabled = true;
+  try {
+    await decryptDownload(decTarget.rel, decTarget.name, pw, function (p, msg) {
+      if (msg) { $('decMsg').textContent = msg; return; }
+      const pc = Math.round(p * 100);
+      $('decMsg').textContent = '解密 ' + pc + '%';
+      $('decBar').firstElementChild.style.width = pc + '%';
+    });
+    $('decMsg').textContent = '解密完成，已开始保存（浏览器可能会问存到哪里）';
+    $('decBar').firstElementChild.style.width = '100%';
+    toast('解密完成');
+  } catch (e) {
+    $('decMsg').textContent = e.message;
+  }
+  $('decGo').disabled = false;
+};
+$('decPw').addEventListener('keydown', function (e) { if (e.key === 'Enter') $('decGo').click(); });
+
+/* ---------- 提取码结果（上传完私有文件后弹一次） ---------- */
+function showCodes(codes) {
+  const box = $('codesList');
+  box.textContent = '';
+  codes.forEach(function (c) {
+    const row = mk('div', 'coderow');
+    row.appendChild(mk('span', 'codename', c.name));
+    row.appendChild(mk('span', 'codebox', c.code));
+    const cp = mk('button', 'btn ghost mini', '复制');
+    cp.type = 'button';
+    cp.onclick = function () { copyText(c.code); };
+    row.appendChild(cp);
+    box.appendChild(row);
+  });
+  $('codesdlg').hidden = false;
+}
+$('codesClose').onclick = function () { $('codesdlg').hidden = true; };
+
+/* ---------- 点击接管：⚙ 打开设置，加密文件点一下先解密 ---------- */
+document.addEventListener('click', function (ev) {
+  const t = ev.target;
+  if (!t || !t.closest) return;
+  const gear = t.closest('.fgear');
+  if (gear) { ev.preventDefault(); ev.stopPropagation(); openSettings(gear); return; }
+  const li = t.closest('li.frow[data-enc="1"]');
+  if (li && t.closest('a.row')) {
+    ev.preventDefault();                                  // 密文直链别直接下，先解密
+    if (picking()) {                                      // 选择模式下点一下 = 勾选，不是下载
+      const cb = li.querySelector ? li.querySelector('.selbox') : null;
+      const rel = li.getAttribute('data-rel');
+      if (cb && rel) {
+        cb.checked = !cb.checked;
+        if (cb.checked) picked.add(rel); else picked.delete(rel);
+        if (li.classList) li.classList.toggle('picked', cb.checked);
+        syncBtns();
+      }
+      return;
+    }
+    openDecrypt(li.getAttribute('data-rel'), li.getAttribute('data-disp') || 'download.bin');
+  }
+}, true);
+
+/* 合并/分别下载都跳过加密文件：服务端只有密文，打包出来也没法用 */
+function pickedRows() {
+  const out = [];
+  const items = filelistEl.querySelectorAll('li.frow');
+  for (let i = 0; i < items.length; i++) {
+    const r = items[i].getAttribute('data-rel');
+    if (r && picked.has(r)) out.push({ rel: r, enc: items[i].getAttribute('data-enc') === '1', name: items[i].getAttribute('data-disp') || r });
+  }
+  return out;
+}
+zipBtn.onclick = function () {
+  const rows = pickedRows();
+  if (!rows.length) return;
+  const plain = rows.filter(function (x) { return !x.enc; });
+  if (!plain.length) return toast('加密文件不能合并下载，请点开逐个解密下载', true);
+  if (plain.length < rows.length) toast('已跳过 ' + (rows.length - plain.length) + ' 个加密文件');
+  location.href = '/zip?' + plain.map(function (x) { return 'f=' + encodeURIComponent(x.rel); }).join('&');
+};
+dlOneBtn.onclick = function () {
+  const rows = pickedRows();
+  const plain = rows.filter(function (x) { return !x.enc; });
+  if (!plain.length) return toast('加密文件请点开逐个解密下载', true);
+  toast('分别下载 ' + plain.length + ' 个文件…');
+  plain.forEach(function (x, i) {
+    setTimeout(function () {
+      const a = document.createElement('a');
+      a.href = '/f/' + x.rel.split('/').map(encodeURIComponent).join('/');
+      a.download = x.name;
+      a.style.display = 'none';
+      document.body.appendChild(a);
+      if (a.click) a.click();
+      setTimeout(function () { if (a.parentNode) a.parentNode.removeChild(a); }, 3000);
+    }, i * 250);
+  });
+};
+
+/* 点空白处或按 Esc 关掉这些新对话框 */
+['undlg', 'setdlg', 'decdlg', 'codesdlg'].forEach(function (id) {
+  const d = $(id);
+  d.addEventListener('click', function (ev) { if (ev.target === d) d.hidden = true; });
+});
+document.addEventListener('keydown', function (ev) {
+  if (ev.key !== 'Escape') return;
+  ['undlg', 'setdlg', 'decdlg', 'codesdlg'].forEach(function (id) { if (!$(id).hidden) $(id).hidden = true; });
+});
 </script></body></html>`;
 }
 
@@ -2613,6 +3588,7 @@ const server = http.createServer((req, res) => {
     return res.end('forbidden');
   }
   const meId = ensureId(req, res);
+  const unlocked = readUnlocked(req);        // 提取码兑换来的通行证（私有文件的可见性靠它兜底）
 
   // 向导模式：只有向导自己的接口能过，其它一律引导到向导（此时只监听 127.0.0.1）
   if (setupMode) {
@@ -2728,6 +3704,75 @@ const server = http.createServer((req, res) => {
     return res.end(n ? n.text : 'not found');
   }
 
+  /* 提取码兑换：一个码只解锁它对应的那些文件，通行证写进 HMAC 签名的 cookie */
+  if (req.method === 'POST' && urlPath === '/unlock') {
+    readJsonBody(req, 4096).then(body => {
+      const code = String(body.code || '').trim().toUpperCase();
+      const meta = readMeta();
+      const hit = Object.keys(meta).filter(rel => isPrivateEntry(meta[rel]) && meta[rel].code && codeMatches(code, meta[rel].code));
+      const set = readUnlocked(req);
+      hit.forEach(r => set.add(r));
+      if (hit.length) {
+        addCookie(res, UNLOCK_COOKIE + '=' + signUnlock([...set]) + '; Path=/; Max-Age=' + Math.floor(UNLOCK_TTL / 1000) + '; HttpOnly; SameSite=Lax');
+      }
+      uiJson(res, 200, { ok: hit.length > 0, count: hit.length, total: set.size });
+    });
+    return;
+  }
+
+  /* 文件设置：重命名 / 可见范围 / 换提取码 —— 只有上传者本人（或服务器本机）能动 */
+  if (req.method === 'PATCH' && urlPath.startsWith('/f/')) {
+    const t = safeRel(urlPath.slice(3));
+    if (!t) { res.writeHead(404); return res.end('not found'); }
+    let st; try { st = fs.statSync(t.full); } catch { res.writeHead(404); return res.end('not found'); }
+    if (!st.isFile()) { res.writeHead(404); return res.end('not found'); }
+    readJsonBody(req).then(body => {
+      const meta = readMeta();
+      const e = meta[t.rel] || {};
+      if (!(isHostSelf(ip) || ownerOk(e, meId, ip))) {
+        res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
+        return res.end(JSON.stringify({ ok: false, error: 'only-uploader', message: L('只有上传者能改这个文件', 'Only the uploader can change this file') }));
+      }
+      let rel = t.rel, full = t.full;
+      const patch = {};
+      if (typeof body.name === 'string' && body.name.trim()) patch.name = safeName(body.name);
+      if (body.vis === 'private' || body.vis === 'public') patch.vis = body.vis;
+      const wantPrivate = patch.vis ? patch.vis === 'private' : isPrivateEntry(e);
+      if (!wantPrivate) patch.code = '';                                  // 转公开就把码作废
+      else if (body.rotate === true || !e.code) patch.code = makeCode();  // 转私有或显式换码时发新码
+      // 明文文件的磁盘名跟着显示名走 —— 别人用资源管理器翻共享目录时看到的也是一致的名字。
+      // 加密文件不动磁盘名（那是随机串），只改元数据里的显示名。
+      if (patch.name && !isEncEntry(e) && patch.name !== path.basename(full)) {
+        const pdir = path.dirname(full);
+        const target = uniqueIn(pdir, patch.name);
+        const nrel = rel.split('/').slice(0, -1).concat([target]).join('/');
+        try { fs.renameSync(full, path.join(pdir, target)); }
+        catch (err) {
+          return uiJson(res, 500, { ok: false, error: 'rename-failed', message: String((err && err.message) || err) });
+        }
+        delete meta[rel];
+        // 便签的正文文件被改名时，notes.jsonl 里的引用要跟着改，否则那条便签就找不到自己的 txt 了
+        const notes = readNotes();
+        let touched = false;
+        for (const n of notes) if (n.file === rel) { n.file = nrel; touched = true; }
+        if (touched) writeNotes(notes);
+        rel = nrel; full = path.join(pdir, target);
+        patch.name = target;
+      }
+      meta[rel] = Object.assign({}, meta[rel] || e, patch);
+      writeMeta(meta);
+      bumpRev();
+      return uiJson(res, 200, {
+        ok: true, rel,
+        name: displayNameOf(rel, meta[rel]),
+        vis: isPrivateEntry(meta[rel]) ? 'private' : 'public',
+        enc: isEncEntry(meta[rel]),
+        code: meta[rel].code || ''
+      });
+    });
+    return;
+  }
+
   if (req.method === 'PUT' && urlPath.startsWith('/u/')) {
     const free = freeBytes();
     if (free !== undefined && free < MIN_FREE) {
@@ -2739,19 +3784,32 @@ const server = http.createServer((req, res) => {
       res.writeHead(413, { 'Content-Type': 'text/plain; charset=utf-8' });
       return res.end('超过单文件上限');
     }
-    // 选整个文件夹上传时带 ?dir=<相对路径>：保留目录结构，但仍然放进当天的文件夹里
+    // 上传时可选的三样设置，都走查询串：
+    //   ?dir=<子目录>   选整个文件夹上传时保留目录结构
+    //   &ren=<显示名>   上传前重命名
+    //   &vis=private    仅自己可见（服务端自动生成提取码回给上传者）
+    //   &enc=1          内容已经在浏览器里加密好了，磁盘上换成随机名、不给任何名字线索
+    let qs = null;
+    try { qs = new URL('http://x/?' + rawQuery).searchParams; } catch { qs = null; }
+    const qget = k => (qs ? qs.get(k) : null);
     let sub = '';
-    try { sub = safeSub(new URL('http://x/?' + rawQuery).searchParams.get('dir')); } catch { sub = null; }
+    try { sub = safeSub(qget('dir')); } catch { sub = null; }
     if (sub === null) {
       res.writeHead(400, { 'Content-Type': 'text/plain; charset=utf-8' });
       return res.end('目录名不合法');
     }
+    const wantEnc = qget('enc') === '1';
+    const wantVis = qget('vis') === 'private' ? 'private' : 'public';
+    const showName = safeName(qget('ren') || urlPath.slice(3));
     const folder = DIR_FILES + '/' + todayFolder() + (sub ? '/' + sub : '');
     const dir = path.join(ROOT, ...folder.split('/'));
     fs.mkdirSync(dir, { recursive: true });
-    const name = uniqueIn(dir, safeName(urlPath.slice(3)));
+    // 加密文件的磁盘名是随机串：翻共享文件夹的人看不出这是什么、叫什么
+    const diskWanted = wantEnc ? crypto.randomBytes(12).toString('hex') + '.bin' : showName;
+    const name = uniqueIn(dir, diskWanted);
     const rel = folder + '/' + name;
     const dest = path.join(dir, name);
+    const newCode = wantVis === 'private' ? makeCode() : '';
     const ws = fs.createWriteStream(dest);
     let failed = false, got = 0, lastCheck = 0;
     const abort = (code, msg) => {
@@ -2784,10 +3842,14 @@ const server = http.createServer((req, res) => {
     });
     ws.on('finish', () => {
       if (failed) return;
-      setFileMeta(rel, ip, meId);
+      // 明文文件：显示名就是磁盘名（重名时 uniqueIn 会加 " (2)"，显示名得跟着走，
+      // 否则两个不同的文件会在列表里显示成同一个名字）。
+      // 加密文件：磁盘名是随机串，显示名才是用户给的真实名。
+      const finalName = wantEnc ? showName : name;
+      setFileMeta(rel, ip, meId, { name: finalName, vis: wantVis, enc: wantEnc, code: newCode });
       bumpRev();
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ ok: true, path: rel, ip }));
+      res.end(JSON.stringify({ ok: true, path: rel, ip, name: finalName, vis: wantVis, enc: wantEnc, code: newCode }));
     });
     return;
   }
@@ -2822,12 +3884,19 @@ const server = http.createServer((req, res) => {
   if ((req.method === 'GET' || req.method === 'HEAD') && urlPath.startsWith('/f/')) {
     const t = safeRel(urlPath.slice(3));
     if (!t) { res.writeHead(404); return res.end('not found'); }
+    const fe = readMeta()[t.rel] || {};
+    if (!canSeeFile(t.rel, fe, meId, ip, unlocked)) { res.writeHead(404); return res.end('not found'); }
+    // 加密文件在磁盘上就是密文，这里发的也是密文（浏览器解密后才是原文件），
+    // 所以强制 octet-stream，并且用真实文件名 + .lsenc 提示它还需要解密
+    if (isEncEntry(fe)) return sendFile(req, res, t.full, { ct: 'application/octet-stream', dlName: displayNameOf(t.rel, fe) + '.lsenc' });
     return sendFile(req, res, t.full, {});                        // 一律强制下载
   }
 
   if ((req.method === 'GET' || req.method === 'HEAD') && urlPath.startsWith('/i/')) {
     const t = safeRel(urlPath.slice(3));
     if (!t || !IMG_EXT.has(extOf(t.full))) { res.writeHead(404); return res.end('not found'); }
+    const ie = readMeta()[t.rel] || {};
+    if (isEncEntry(ie) || !canSeeFile(t.rel, ie, meId, ip, unlocked)) { res.writeHead(404); return res.end('not found'); }
     return sendFile(req, res, t.full, { inline: true, cache: 'private, max-age=120' });
   }
 
@@ -2835,6 +3904,8 @@ const server = http.createServer((req, res) => {
   if ((req.method === 'GET' || req.method === 'HEAD') && urlPath.startsWith('/m/')) {
     const t = safeRel(urlPath.slice(3));
     if (!t || !MEDIA_EXT.has(extOf(t.full))) { res.writeHead(404); return res.end('not found'); }
+    const me0 = readMeta()[t.rel] || {};
+    if (isEncEntry(me0) || !canSeeFile(t.rel, me0, meId, ip, unlocked)) { res.writeHead(404); return res.end('not found'); }
     return sendFile(req, res, t.full, { inline: true, cache: 'private, max-age=120' });
   }
 
@@ -2842,7 +3913,13 @@ const server = http.createServer((req, res) => {
     let wanted = [];
     try { wanted = new URL('http://x/?' + rawQuery).searchParams.getAll('f'); } catch { wanted = []; }
     const seen = new Set(), entries = [];
+    const zmeta = readMeta();
     let skipped = 0;
+    // 私有且没兑换过提取码的文件、以及加密文件（服务端解不开）都不进压缩包
+    const zipAllowed = rel => {
+      const ze = zmeta[rel] || {};
+      return !isEncEntry(ze) && canSeeFile(rel, ze, meId, ip, unlocked);
+    };
     const addFile = (full, rel, st) => {
       if (seen.has(rel)) return;
       seen.add(rel);
@@ -2856,20 +3933,22 @@ const server = http.createServer((req, res) => {
       for (const it of items) {
         if (entries.length >= MAX_ZIP_ENTRIES) { skipped++; continue; }
         const full = path.join(absDir, it.name);
+        const childRel = prefix + '/' + it.name;
         if (it.isSymbolicLink() || !stillInside(full)) { skipped++; continue; }   // 不跟着链接跑出共享目录
+        if (!zipAllowed(childRel)) { skipped++; continue; }
         if (it.isDirectory()) {
           if (SKIP_DIRS.has(it.name)) { skipped++; continue; }
-          walkDir(full, prefix + '/' + it.name);
+          walkDir(full, childRel);
           continue;
         }
         if (!it.isFile()) { skipped++; continue; }
         let st; try { st = fs.statSync(full); } catch { skipped++; continue; }
-        addFile(full, prefix + '/' + it.name, st);
+        addFile(full, childRel, st);
       }
     };
     for (const raw of wanted) {
       const t = safeRel(raw);
-      if (!t) { skipped++; continue; }
+      if (!t || !zipAllowed(t.rel)) { skipped++; continue; }
       let st; try { st = fs.statSync(t.full); } catch { skipped++; continue; }
       if (st.isFile()) { addFile(t.full, t.rel, st); continue; }
       if (st.isDirectory()) { walkDir(t.full, path.basename(t.rel)); continue; }
@@ -2919,7 +3998,7 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === 'GET' && (urlPath === '/' || urlPath === '')) {
-    const files = listFiles();
+    const files = listFiles(meId, ip, unlocked);
     res.writeHead(200, {
       'Content-Type': 'text/html; charset=utf-8',
       'Cache-Control': 'no-store',
@@ -2927,7 +4006,7 @@ const server = http.createServer((req, res) => {
       'Referrer-Policy': 'no-referrer',
       'X-Rev': String(LIST_REV)
     });
-    return res.end(page(files, meId, ip));
+    return res.end(page(files, ip));
   }
 
   res.writeHead(404); res.end('not found');

@@ -47,6 +47,8 @@ into <kbd>Win</kbd>+<kbd>R</kbd> → `shell:startup`.
 | `GET` | `/t/list` | notes from the last 24 h (`?older=1` for the rest) |
 | `POST` / `DELETE` | `/t`, `/t/<id>` | add a note / delete a note and its `.txt` |
 | `GET` | `/t/raw/<id>` | a note as plain text |
+| `POST` | `/unlock` | redeem an extract code for a pass cookie (private files need it) |
+| `PATCH` | `/f/<rel>` | file settings: rename / change visibility / rotate the extract code — uploader only |
 | `*` | `/setup`, `/setup/api/*` | the first-run wizard — loopback only, gone once configured |
 
 ## Live refresh, read-only mode, QR
@@ -71,14 +73,80 @@ into <kbd>Win</kbd>+<kbd>R</kbd> → `shell:startup`.
   (no `..`, no reserved device names, no Windows-illegal characters, at most 8 levels). Dropping a
   folder uses `webkitGetAsEntry` to walk it, and *pick a whole folder* uses `webkitdirectory`.
 
+## Visibility, extract codes, and browser-side encryption
+
+**Metadata.** Each record in `-data/files.json` (older records lack these fields and are read with defaults,
+so no migration is needed):
+
+| Field | Meaning |
+|---|---|
+| `id` / `ip` / `t` | uploader's cookie identity / IP / time (pre-existing) |
+| `name` | display name; an encrypted file's on-disk name is random, the real name lives only here |
+| `vis` | `'public'` (default) or `'private'` |
+| `enc` | `true` = the bytes on disk are client-side ciphertext; the server holds no key |
+| `code` | private files only: the 6-character extract code (stored in cleartext under `-data`, sent to the owner only) |
+
+**Access control** is decided in one place (`canSeeFile`): public files are visible to everyone, a private one
+only to the uploader's cookie, the host itself (`127.0.0.1`/`::1`), or a browser that redeemed the code.
+Invisible files are filtered out inside `listFiles()` (absent from the list, not counted in `tabCount`), and
+`/f/`, `/i/`, `/m/` and `/zip` return 404 for them — even their existence is hidden. Note that pruning stale
+metadata keys must run over *all* files rather than the filtered list, otherwise records for private files the
+current browser cannot see would be deleted.
+
+**Extract-code passes.** `POST /unlock` compares the code (case-insensitive, constant-time), then merges the
+matching rels into an HMAC-SHA256 signed cookie (`lan_ok`, 7 days). The server keeps no state, so a restart
+invalidates all passes (just re-enter the code); one pass holds at most 200 files so the cookie cannot blow up.
+Redeeming is not treated as a write, so it still works in read-only mode — it only changes visibility.
+
+**Encrypted file format** (a 64-byte header plus per-chunk AEAD; the server never parses it):
+
+```
+offset len  content
+0      7    'LSENC1\0'
+7      1    version = 1
+8      1    KDF = 1 (PBKDF2-HMAC-SHA256)
+9      1    cipher = 2 (ChaCha20-Poly1305)
+12     4    iterations (LE u32, default 150000)
+16     16   salt
+32     4    chunk size (LE u32, default 8 MiB)
+36     4    IV prefix (random per file; completes the 12-byte nonce)
+40     8    plaintext length (LE u64, so >4 GB is expressible)
+48     16   reserved
+```
+
+Chunk *i* is `ChaCha20-Poly1305(key, iv = ivPrefix || le64(i), aad = le64(i), chunk)`; ciphertext length is
+the chunk length plus the 16-byte tag. The chunk index goes into both the nonce and the AAD, so reordering,
+duplication, truncation or flipping any byte fails authentication. Key = `PBKDF2(password, salt, iter, 32)`.
+
+**Why pure JS instead of WebCrypto.** `http://192.168.x.x` is not a secure context, and browsers do **not**
+expose `crypto.subtle` on such pages — which is exactly how this tool is normally used (scan the QR code on a
+phone). So SHA-256, HMAC, PBKDF2, ChaCha20 and Poly1305 are implemented here from scratch; randomness still
+comes from `crypto.getRandomValues`, which is not restricted to secure contexts. Correctness is established by
+comparing every primitive against OpenSSL (sha256, hmac, pbkdf2, the ChaCha20 keystream, and ChaCha20-Poly1305
+ciphertext plus tag) and against the RFC 8439 §2.8.2 vector; throughput is about 18 MB/s, and PBKDF2 with
+150k iterations takes ~0.8 s on desktop V8.
+
+Upload path (client): encrypt into a Blob chunk by chunk, then `PUT /u/...?enc=1&ren=<real name>&vis=`.
+The server only receives the `enc=1` flag: it marks the record, stores the bytes as `24-hex-random.bin`, and
+forces `application/octet-stream` with the real name plus `.lsenc` on `/f/`. Download path: fetch the header
+with `Range: bytes=0-63`, derive the key, pull and decrypt chunk by chunk, then save the assembled Blob.
+
+**Encrypting a file that is already on the server** (⚙ → *Encrypt this file*) reuses the same primitives in the
+order "download the whole file → encrypt → upload the ciphertext → DELETE the original". Uploading before
+deleting is deliberate: an interruption leaves a spare copy instead of losing data. The encrypted copy lands in
+the folder for today (the upload endpoint cannot write into an arbitrary dated folder), files above 1 GB are
+refused (the whole file has to fit in browser memory), and note bodies are excluded because deleting the
+original would also drop that note's record.
+
 ## Files on disk
 
 ```
 shared/                          the served content — all /f/ and /i/ can reach
   文件/2026-09-25/…               uploads, one folder per day
+  文件/…/a3f9c1….bin             encrypted upload: random name + ciphertext (real name in files.json)
   快捷文本/2026-09-27_101500.txt   one .txt per note
 shared-data/                     bookkeeping, deliberately outside the shared folder
-  files.json                     rel → { id, ip, t }
+  files.json                     rel → { id, ip, t, name, vis, enc, code }
   notes.jsonl                    one JSON object per line
 lan-share.json                   wizard config (exe only; falls back to %APPDATA%\lan-share)
 ```
@@ -111,15 +179,24 @@ when that folder is not writable, and — only if you tick autostart — one reg
 
 - **No authentication and no HTTPS** — anyone who can reach the port can read and write
   everything. Never expose it to the internet without a reverse proxy (or VPN) in front.
-- **`DELETE /t/<id>` has no ownership check**: any LAN client can delete any note (file deletion
-  *is* checked against the uploader).
+- **"Only me" and extract codes are passes, not accounts** — identity is a cookie and the code is
+  6 characters (roughly 890 million combinations, guessable online with no rate limit); whoever
+  holds the cookie or the code holds the access. Codes live in cleartext in `-data/files.json`.
+- **Encryption protects content only** — names, sizes and uploader IPs stay metadata, and a lost
+  password is unrecoverable. Encrypted files are skipped by `/zip` (the server cannot decrypt them)
+  and cannot be previewed or played inline; decryption buffers the whole file in browser memory,
+  which is impractical on a phone for multi-gigabyte files. Renaming an encrypted file only changes
+  its display name.
 - **Zipping is capped at ~3.9 GB** per request (no ZIP64), and a streamed zip cannot be resumed —
   the archive is generated while it is sent, so `Range` does not apply to `/zip`. Single files
   (`/f/`, `/i/`, `/m/`) do resume.
 - **The file list is walked on every page load** (up to 12 levels deep) — fine for hundreds of
-  files, not hundreds of thousands.
+  files, not hundreds of thousands. The staging list is one DOM subtree per file, so dropping
+  thousands of files at once is slow as well.
 - **The interface is Chinese only.** The language plumbing is in place (`?lang=en`, a `lan_lang`
   cookie, `L(zh, en)` for newer strings) but the existing copy has not been moved into the string
   table yet, so `AUTO_LANG` is off on purpose: an English-locale browser still gets the consistent
   Chinese page instead of a half-translated one.
 - **The prebuilt exe is unsigned and Windows x64 only.**
+- **The pure-JS crypto has not been third-party audited** — it is compared against OpenSSL and the
+  RFC 8439 vector, but it is not a cryptography library.

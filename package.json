@@ -1,6 +1,6 @@
 {
   "name": "best_lan-share",
-  "version": "0.2.1-beta",
+  "version": "0.3.0-beta",
   "description": "Zero-dependency LAN file & text sharing server - a single Node.js file, no npm install",
   "private": true,
   "license": "MIT",
