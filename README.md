@@ -2,7 +2,7 @@
 
 > 同一网络下的设备之间互传文件、互传文字 —— 一个 Node.js 文件，零依赖。
 
-[English →](README.en.md)
+中文 | [English](README.en.md)
 
 <p align="center">
   <img src="docs/screenshots/mobile-files.png" width="230" alt="手机上的文件列表">
