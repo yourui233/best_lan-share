@@ -879,11 +879,14 @@ function fileGroupHtml(files) {
       const imgUrl = '/i/' + urlSegs;
       const kind = kindOf(f.name);                       // 类型看显示名：加密文件的磁盘名是随机串
       const isMedia = !f.enc && (kind === 'video' || kind === 'audio');
+      // 点一下被「在线播放 / 图片预览」接管的文件，不在这里挂按钮（列表和网格都会变乱），
+      // 下载入口放进灯箱顶部 —— 反正点了就是进灯箱，见下面的 openLb / openMedia。
+      const dlAttr = ` data-dl="${href}" data-dname="${esc(f.name)}"`;
       const thumb = (!f.enc && isImg(f.name))
-        ? `<img class="thumb" src="${imgUrl}" data-img="${imgUrl}" loading="lazy" alt="">`
+        ? `<img class="thumb" src="${imgUrl}" data-img="${imgUrl}"${dlAttr} loading="lazy" alt="">`
         : `<span class="thumb ico">${f.enc ? '🔐' : (isMedia ? (kind === 'video' ? '▶' : '♪') : kindLabel(f.name))}</span>`;
       const mediaAttr = isMedia
-        ? ` data-media="/m/${urlSegs}" data-mkind="${kind}" title="${L('点一下在线播放', 'Click to play')}"`
+        ? ` data-media="/m/${urlSegs}" data-mkind="${kind}"${dlAttr} title="${L('点一下在线播放', 'Click to play')}"`
         : '';
       const tags = (f.vis === 'private' ? `<span class="tagon" title="${L('仅自己可见', 'Only you can see this')}">🔒</span>` : '')
         + (f.enc ? `<span class="tagon" title="${L('浏览器端加密，需要密码', 'End-to-end encrypted - password required')}">🔐</span>` : '');
@@ -1130,15 +1133,31 @@ function page(files, meIp) {
  .sk{border-radius:12px;background:var(--card);border:1px solid var(--line);height:74px;
    animation:pulse 1.4s ease-in-out infinite}
  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
- .lb{position:fixed;inset:0;z-index:80;background:rgba(0,0,0,.9);display:grid;place-items:center;
-   opacity:0;transition:opacity .16s;padding:20px}
+ .lb{position:fixed;inset:0;height:100vh;height:100dvh;z-index:80;background:rgba(0,0,0,.9);
+   display:grid;place-items:center;opacity:0;transition:opacity .16s;
+   padding:76px 20px 20px}                     /* 上边 76 = 顶部那行（14 起 + 46 高）+ 16 间隙 */
  .lb.in{opacity:1}
- .lb img{max-width:100%;max-height:100%;border-radius:8px;object-fit:contain}
- .lb video{max-width:100%;max-height:100%;border-radius:8px;background:#000}
+ /* 这里不能用 max-height:100%：网格里那行是 auto 高度（不确定），百分比解析不出来，
+    视频就按自己的比例撑出去，底部的进度条被切到屏幕外——只有全屏才看得到（用户报的）。
+    用 dvh 换算成确定长度，媒体框就永远落在可视区域内。96px = 上 76 + 下 20 的 padding。 */
+ .lb img{max-width:100%;max-height:calc(100vh - 96px);max-height:calc(100dvh - 96px);
+   border-radius:8px;object-fit:contain}
+ .lb video{max-width:100%;max-height:calc(100vh - 96px);max-height:calc(100dvh - 96px);
+   border-radius:8px;background:#000;object-fit:contain}
  .lb audio{width:min(560px,90vw)}
  .lbclose{position:absolute;top:calc(14px + env(safe-area-inset-top));right:16px;border:0;
    background:rgba(255,255,255,.16);color:#fff;font:600 18px/1 inherit;padding:9px 13px;
-   border-radius:11px;cursor:pointer}
+   border-radius:11px;cursor:pointer;z-index:2}
+ /* 灯箱顶部：左边文件名 + 下载，右边关闭。点一下就能存下来，列表里就不用挂按钮了。
+    这行压在媒体上方、又是整行宽，必须不让它吃点击：除了按钮本身，其余部分 pointer-events:none，
+    否则播放器上沿那一条（点一下暂停）会被这行透明区域接走。z-index 也写死，别跟视频比谁在上面。 */
+ .lbtop{position:absolute;top:calc(14px + env(safe-area-inset-top));left:16px;right:74px;
+   display:flex;align-items:center;gap:10px;min-width:0;pointer-events:none;z-index:2}
+ .lbname{color:rgba(255,255,255,.8);font-size:14px;white-space:nowrap;overflow:hidden;
+   text-overflow:ellipsis;min-width:0}
+ .lbdl{flex:0 0 auto;text-decoration:none;background:rgba(255,255,255,.16);color:#fff;border:0;
+   font:600 14px/1 inherit;padding:10px 14px;border-radius:11px;cursor:pointer;pointer-events:auto}
+ .lbdl:hover{background:rgba(255,255,255,.28)}
  #toast{position:fixed;left:50%;bottom:26px;transform:translate(-50%,20px);z-index:90;
    background:#111827;color:#fff;padding:11px 18px;border-radius:11px;font-size:14px;
    opacity:0;pointer-events:none;transition:.22s;max-width:86vw;text-align:center}
@@ -1253,7 +1272,7 @@ ${READONLY ? `
       <input id="dir" type="file" webkitdirectory directory multiple hidden>
       <button class="btn ghost mini" id="pickDir" type="button">${L('或选整个文件夹', 'or pick a whole folder')}</button>
     </div>
-    <div class="stage ro-hide" id="stage" hidden>
+    <div class="stage${READONLY ? ' ro-hide' : ''}" id="stage" hidden>
       <div class="stagebar">
         <span class="tbinfo" id="stageInfo"></span>
         <button class="btn ghost mini" id="stageClear" type="button">${L('清空', 'Clear')}</button>
@@ -1279,7 +1298,7 @@ ${READONLY ? `
 </div>
 
 <div class="dragmask" id="mask">松开即可上传</div>
-<div class="lb" id="lb" hidden><img id="lbimg" alt=""><video id="lbvid" controls playsinline hidden></video><audio id="lbaud" controls hidden></audio><button class="lbclose" id="lbclose">关闭 ✕</button></div>
+<div class="lb" id="lb" hidden><img id="lbimg" alt=""><video id="lbvid" controls playsinline hidden></video><audio id="lbaud" controls hidden></audio><div class="lbtop"><span class="lbname" id="lbname"></span><a class="lbdl" id="lbdl" href="#" download hidden>⬇ ${L('下载', 'Download')}</a></div><button class="lbclose" id="lbclose">关闭 ✕</button></div>
 <div class="actbar" id="actbar" hidden>
   <div class="ab">
     <span class="abinfo"><b id="abCount">0</b> 已选</span>
@@ -1409,6 +1428,15 @@ function fmtSpeed(bps){
   if (bps < 1048576) return (bps/1024).toFixed(0) + ' KB/s';
   return (bps/1048576).toFixed(1) + ' MB/s';
 }
+/* 体积格式化。服务端渲染时用的是上面那个同名函数，但它只活在 Node 里、
+   不会跟着页面发到浏览器，所以客户端这份运行时逻辑（待上传列表、加密提示）
+   必须自己有一份。两份改的时候要一起改。 */
+function human(n){
+  if (n < 1024) return n + ' B';
+  if (n < 1048576) return (n/1024).toFixed(1) + ' KB';
+  if (n < 1073741824) return (n/1048576).toFixed(1) + ' MB';
+  return (n/1073741824).toFixed(2) + ' GB';
+}
 
 /* ---------- 页签 ---------- */
 const tabsEl = $('tabs'), pill = $('pill');
@@ -1458,7 +1486,17 @@ window.addEventListener('resize', () => movePill($('tabFile').classList.contains
 
 /* ---------- 灯箱 ---------- */
 const lb = $('lb'), lbimg = $('lbimg'), lbvid = $('lbvid'), lbaud = $('lbaud');
+const lbdl = $('lbdl'), lbname = $('lbname');
 function lbShow(){ lb.hidden = false; requestAnimationFrame(() => lb.classList.add('in')); }
+/* 灯箱顶部那个下载入口：加密文件不进灯箱，所以这里拿到的永远是明文直链。
+   href/download 都靠这里设，没有直链就把按钮藏掉。 */
+function lbSetDl(href, name){
+  if (!href) { lbdl.hidden = true; lbdl.removeAttribute('href'); lbdl.removeAttribute('download'); lbname.textContent = ''; return; }
+  lbdl.hidden = false;
+  lbdl.setAttribute('href', href);
+  lbdl.setAttribute('download', name || '');
+  lbname.textContent = name || '';
+}
 function stopMedia(){
   for (const el of [lbvid, lbaud]) {
     try { el.pause(); } catch (e) {}
@@ -1468,13 +1506,14 @@ function stopMedia(){
   }
   lbimg.removeAttribute('src');
 }
-function openLb(src){ stopMedia(); lbimg.hidden = false; lbimg.src = src; lbShow(); }
-function openMedia(src, kind){
+function openLb(src, dlHref, dlName){ stopMedia(); lbimg.hidden = false; lbimg.src = src; lbSetDl(dlHref, dlName); lbShow(); }
+function openMedia(src, kind, dlHref, dlName){
   stopMedia();
   const el = kind === 'audio' ? lbaud : lbvid;
   lbimg.hidden = true;
   el.hidden = false;
   el.src = src;
+  lbSetDl(dlHref, dlName);
   const p = el.play && el.play();
   if (p && p.catch) p.catch(() => {});       // 浏览器可能因为没有用户手势拒绝，让它自己显示控制条
   lbShow();
@@ -1484,19 +1523,21 @@ function closeLb(){
   setTimeout(() => { lb.hidden = true; stopMedia(); }, 160);
 }
 lb.addEventListener('click', closeLb);
+lbdl.addEventListener('click', ev => ev.stopPropagation());   // 点了下载别顺手把灯箱关掉
 document.addEventListener('keydown', e => { if (e.key === 'Escape' && !lb.hidden) closeLb(); });
 document.addEventListener('click', ev => {
   const el = ev.target && ev.target.closest ? ev.target.closest('[data-img],[data-media]') : null;
   if (!el) return;
+  const dl = el.getAttribute('data-dl'), dn = el.getAttribute('data-dname');
   const media = el.getAttribute('data-media');
   if (media) {
     if (picking()) return;                   // 选择模式下点一下是勾选，不是播放
     ev.preventDefault();
-    openMedia(media, el.getAttribute('data-mkind'));
+    openMedia(media, el.getAttribute('data-mkind'), dl, dn);
     return;
   }
   ev.preventDefault();
-  openLb(el.getAttribute('data-img'));
+  openLb(el.getAttribute('data-img'), dl, dn);
 });
 
 /* ---------- 文本 ---------- */
