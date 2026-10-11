@@ -1,7 +1,7 @@
 # 技术细节
 
-## 从源码运行
 
+## 从源码运行
 ```bash
 git clone https://github.com/yourui233/best_lan-share.git && cd best_lan-share
 node share-server.js ./shared 8080
@@ -32,7 +32,6 @@ node share-server.js ./shared 8080
 <kbd>Win</kbd>+<kbd>R</kbd> → `shell:startup` 即可。
 
 ## HTTP 路由
-
 | 方法 | 路径 | 作用 |
 |---|---|---|
 | `GET` | `/` | 应用页面,文件列表由服务端渲染(带 `X-Rev` 头) |
@@ -51,7 +50,6 @@ node share-server.js ./shared 8080
 | `*` | `/setup`、`/setup/api/*` | 首次运行的安装向导 —— 只监听回环,配置好即消失 |
 
 ## 实时刷新、只读模式、二维码
-
 - **实时刷新**:`LIST_REV` 是个内存计数器,上传完成、删文件、删便签、切换只读都会 +1。
   `GET /rev` 返回它(`/` 和 `/t/list` 的响应头里也有 `X-Rev`)。页面每 3 秒问一次,**只在页面可见
   时问**,而且只有数字变了才真的重拉列表 —— 所以另一台设备传完文件这边会自动出现,搜索词、排序、
@@ -69,7 +67,6 @@ node share-server.js ./shared 8080
   「或选整个文件夹」用 `webkitdirectory`。
 
 ## 可见范围、提取码与浏览器端加密
-
 **元数据**（`-data/files.json` 的每条记录，老记录没有这些字段，一律按默认值读，不需要迁移）：
 
 | 字段 | 含义 |
@@ -130,7 +127,6 @@ PBKDF2 15 万次迭代约 0.8 秒（桌面 V8）。
 （要整份读进浏览器内存），便签正文文件也不开放这个入口（删原件会连带删掉 notes 里那条记录）。
 
 ## 目录结构
-
 ```
 shared/                          对外提供的内容 —— /f/ 和 /i/ 只能看到这里
   文件/2026-09-25/…               上传落地,一天一个文件夹
@@ -146,7 +142,6 @@ lan-share.json                   向导写出的配置(仅 exe;写不进去时�
 上传者的 id 记在 `files.json` 里挨着每个文件。来自 `127.0.0.1` 的请求视为主人,可以删任何文件。
 
 ## exe 是怎么构建的
-
 单文件、约 2900 行、没有框架:`share-server.js` 服务端渲染整个页面并负责一切。exe 就是你本机的
 `node.exe`,把 `share-server.js` 作为
 [Node SEA](https://nodejs.org/api/single-executable-applications.html) blob 注入进去:
@@ -165,7 +160,6 @@ powershell -ExecutionPolicy Bypass -File tools\build-exe.ps1 -Version 0.1.0-beta
 `wscript.exe` 启动脚本。`--setup` 重新走向导,`--uninstall` 清掉开机启动、快捷方式和配置。
 
 ## 已知限制
-
 - **没有鉴权、没有 HTTPS** —— 能访问到端口的人就能读写一切。不要直接暴露到公网,确有外网需求
   请放在带认证的反向代理(或 VPN)后面。
 - **"仅自己可见"和提取码都只是通行证,不是账号** —— 身份是 cookie,提取码是 6 位字符串(约 8.9 亿种
@@ -182,5 +176,3 @@ powershell -ExecutionPolicy Bypass -File tools\build-exe.ps1 -Version 0.1.0-beta
   `L(zh, en)`),但老文案还没迁进语言表,所以 `AUTO_LANG` 是刻意关掉的:英文系统的浏览器
   仍然拿到完整的中文页面,而不是"一半中文一半英文"。
 - **预编译的 exe 没有签名,且只有 Windows x64 版。**
-- **纯 JS 的加密实现没有经过第三方审计** —— 与 OpenSSL 逐项比对过,也有 RFC 8439 官方向量,
-  但它不是密码学库。
